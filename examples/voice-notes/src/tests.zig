@@ -11,7 +11,7 @@ fn drain(model: *main.Model, fx: *main.Effects) void {
     while (fx.takeMsg()) |msg| main.update(model, msg, fx);
 }
 
-test "NullPlatform supplies the selected device and sends PCM only to the app sink" {
+test "consent unlocks device selection and NullPlatform sends PCM only to the app sink" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{ .size = geometry.SizeF.init(main.window_width, main.window_height) });
     defer harness.destroy(testing.allocator);
     harness.null_platform.gpu_surfaces = true;
@@ -42,9 +42,27 @@ test "NullPlatform supplies the selected device and sends PCM only to the app si
         .nonblank = true,
     } });
 
-    // Boot enumerates through PlatformServices. Selecting by index pins the
-    // opaque USB id, rather than asking the Null host for its default.
+    // The sample intentionally does not enumerate or open a microphone until
+    // the user has made the consent choice. Its short probe uses the same
+    // platform service that makes macOS show the real permission request.
+    try testing.expectEqual(main.PermissionState.needs_request, app_state.model.permission);
+    try testing.expectEqual(@as(usize, 0), app_state.model.device_count);
+    try app_state.dispatch(&harness.runtime, 1, .request_permission);
+    try testing.expectEqual(main.PermissionState.requesting, app_state.model.permission);
+    // The consent probe intentionally has the direct sink but has not armed
+    // CaptureStore, so it cannot accidentally create a partial voice note.
+    try harness.null_platform.feedAudioInputFrame(1_500_000, &.{ 0.25, -0.25 }, false);
+    try testing.expectEqual(@as(usize, 0), capture.sampleCount());
+    const permission_started = harness.null_platform.takeAudioInputStarted().?;
+    try harness.runtime.dispatchPlatformEvent(app, permission_started);
+    try testing.expectEqual(main.PermissionState.granted, app_state.model.permission);
     try testing.expectEqual(@as(usize, 2), app_state.model.device_count);
+    try testing.expectEqual(@as(usize, 0), capture.sampleCount());
+    try testing.expectEqual(@as(usize, 1), harness.null_platform.audio_input_start_count);
+    try testing.expectEqual(@as(usize, 1), harness.null_platform.audio_input_stop_count);
+
+    // Selecting by index pins the opaque USB id, rather than asking the Null
+    // host for its default.
     try app_state.dispatch(&harness.runtime, 1, .{ .select_device = 1 });
     try app_state.dispatch(&harness.runtime, 1, .start);
     const started = harness.null_platform.takeAudioInputStarted().?;
@@ -71,6 +89,7 @@ test "a selected input starts a direct PCM sink and saves a WAV through effects"
     try model.devices[0].set("usb-mic", "USB microphone", true);
     model.device_count = 1;
     model.selected_device = 0;
+    model.permission = .granted;
 
     var fx = main.Effects.init(testing.allocator);
     defer fx.deinit();
@@ -122,6 +141,7 @@ test "a stale lifecycle event cannot end the replacement capture" {
     const capture = try main.CaptureStore.create(testing.allocator);
     defer capture.destroy();
     var model = main.Model.init(capture);
+    model.permission = .granted;
     var fx = main.Effects.init(testing.allocator);
     defer fx.deinit();
     fx.executor = .fake;
@@ -140,12 +160,63 @@ test "a stale lifecycle event cannot end the replacement capture" {
     try testing.expectEqual(main.CapturePhase.requesting, model.phase);
 }
 
-test "the view exposes default selection, device selection, and recording controls" {
+test "the first view requests microphone access before exposing recorder controls" {
     const capture = try main.CaptureStore.create(testing.allocator);
     defer capture.destroy();
     var model = main.Model.init(capture);
     try model.devices[0].set("built-in", "Built-in microphone", true);
     model.device_count = 1;
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.VoiceNotesUi.init(arena_state.allocator());
+    const tree = try ui.finalize(main.view(&ui, &model));
+    var nodes: [128]canvas.WidgetLayoutNode = undefined;
+    const layout = try canvas.layoutWidgetTree(tree.root, geometry.RectF.init(0, 0, main.window_width, main.window_height), &nodes);
+    try testing.expect(layout.nodes.len > 0);
+    const permission_panel = findLayoutByLabel(layout, "Microphone permission").?;
+    try testing.expectApproxEqAbs(main.window_width / 2, permission_panel.frame.x + permission_panel.frame.width / 2, 0.01);
+    try testing.expectApproxEqAbs(main.window_height / 2, permission_panel.frame.y + permission_panel.frame.height / 2, 0.01);
+    try testing.expect(findByText(tree.root, .button, "Allow microphone") != null);
+    try testing.expect(findByText(tree.root, .button, "Start recording") == null);
+    try testing.expect(findByText(tree.root, .button, "System default") == null);
+}
+
+test "a permission refusal keeps the recorder unavailable and can be retried" {
+    const capture = try main.CaptureStore.create(testing.allocator);
+    defer capture.destroy();
+    var model = main.Model.init(capture);
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&model, .request_permission, &fx);
+    const request = fx.pendingAudioInput().?;
+    try testing.expectEqual(main.permission_key, request.key);
+    try testing.expectEqual(main.PermissionState.requesting, model.permission);
+    try testing.expectEqual(@as(usize, 0), capture.sampleCount());
+
+    try fx.feedAudioInputEvent(.{ .session_id = request.session_id, .kind = .permission_denied });
+    drain(&model, &fx);
+    try testing.expectEqual(main.PermissionState.denied, model.permission);
+    try testing.expectEqual(main.CapturePhase.idle, model.phase);
+    try testing.expect(fx.pendingAudioInput() == null);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ui = main.VoiceNotesUi.init(arena_state.allocator());
+    const tree = try ui.finalize(main.view(&ui, &model));
+    try testing.expect(findByText(tree.root, .button, "Try again") != null);
+    try testing.expect(findByText(tree.root, .button, "Start recording") == null);
+}
+
+test "the recorder view exposes source selection and live input diagnostics after consent" {
+    const capture = try main.CaptureStore.create(testing.allocator);
+    defer capture.destroy();
+    var model = main.Model.init(capture);
+    try model.devices[0].set("built-in", "Built-in microphone", true);
+    model.device_count = 1;
+    model.permission = .granted;
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -164,6 +235,13 @@ fn findByText(widget: canvas.Widget, kind: canvas.WidgetKind, text: []const u8) 
     if (widget.kind == kind and std.mem.eql(u8, widget.text, text)) return widget;
     for (widget.children) |child| {
         if (findByText(child, kind, text)) |found| return found;
+    }
+    return null;
+}
+
+fn findLayoutByLabel(layout: canvas.WidgetLayoutTree, label: []const u8) ?canvas.WidgetLayoutNode {
+    for (layout.nodes) |node| {
+        if (std.mem.eql(u8, node.widget.semantics.label, label)) return node;
     }
     return null;
 }
