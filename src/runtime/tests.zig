@@ -24,6 +24,7 @@ test {
     _ = @import("effects_image_tests.zig");
     _ = @import("effects_host_tests.zig");
     _ = @import("ts_core_host_tests.zig");
+    _ = @import("effects_audio_input_tests.zig");
     _ = @import("clock.zig");
     _ = @import("frame_profile.zig");
     _ = @import("markdown_app_tests.zig");

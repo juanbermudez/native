@@ -269,6 +269,9 @@ pub const Event = union(enum) {
     /// tick, completion, failure): the ui-app layer routes it back
     /// through `Effects.takeAudioMsg` into the app's `on_event` Msg.
     audio: platform.AudioEvent,
+    /// Compact microphone lifecycle and device reports. PCM stays on the
+    /// dedicated audio-input sink and never enters runtime events.
+    audio_input: platform.AudioInputEvent,
     files_dropped: platform.FileDropEvent,
     gpu_surface_frame: GpuSurfaceFrameEvent,
     gpu_surface_resized: GpuSurfaceResizeEvent,
@@ -296,6 +299,7 @@ pub const Event = union(enum) {
             .timer => "timer",
             .effects_wake => "effects_wake",
             .audio => "audio",
+            .audio_input => "audio_input",
             .files_dropped => "files_dropped",
             .gpu_surface_frame => "gpu_surface_frame",
             .gpu_surface_resized => "gpu_surface_resized",

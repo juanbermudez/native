@@ -74,6 +74,12 @@ Every app declares `permissions` and `capabilities` in `app.zon` — the runtime
 
 Custom permissions use reverse-DNS names (e.g. `com.example.my-permission`). Use the smallest set that covers your app.
 
+### Microphone packaging
+
+On macOS, declaring `.permissions = .{ "microphone" }` causes `native package` to write `NSMicrophoneUsageDescription` into the app bundle's `Info.plist`. The prompt says that the app's display name needs microphone access to capture audio. Apps that do not declare `microphone` ship no microphone privacy declaration.
+
+The permission is necessary but not sufficient: the first audio-input preview is implemented only by the macOS system-WebView host. That host still asks macOS for consent at use time; macOS Chromium, Windows, Linux, iOS, and Android report the audio-input service as unsupported.
+
 ### Available capabilities
 
 <table>

@@ -74,6 +74,13 @@ Web content itself is declare-to-use: an app ships the embedded web layer only w
       <td>macOS system-engine host (an MTAudioProcessingTap on the app's single AVPlayer feeding a vDSP FFT — local files, cache entries, and streams alike), Windows system WebView (process-scoped WASAPI loopback capture of THIS app's audio session only — never other apps' audio — with an in-box FFT), and Linux system WebView (GStreamer's <code>spectrum</code> element as the playbin's audio-filter; requires gst-plugins-good, probed live); hosts that cannot analyze — macOS Chromium, pre-2004 Windows, spectrum-less GStreamer setups, iOS, Android — report <code>audio_spectrum</code> unsupported and simply never send the events: honest absence, never fabricated bands</td>
     </tr>
     <tr>
+      <td>Audio input <em>(preview)</em></td>
+      <td><code>fx.listAudioInputDevices(...)</code> / <code>fx.startAudioInput(...)</code> / <code>fx.stopAudioInput()</code></td>
+      <td>None in this preview. The Native bridge is deliberately not a second media-stream API.</td>
+      <td><code>microphone</code></td>
+      <td>macOS system WebView only: device snapshots and explicit selection, default-source changes, and timestamped PCM frames delivered to an application-owned direct sink. PCM never crosses the bridge, runtime event queue, effect Msg queue, or session journal. macOS Chromium, Windows, Linux, iOS, and Android report <code>audio_input</code> unsupported.</td>
+    </tr>
+    <tr>
       <td>File drops</td>
       <td><code>Event.files_dropped</code></td>
       <td><code>window.zero.on("drop:files")</code></td>
@@ -105,6 +112,12 @@ Web content itself is declare-to-use: an app ships the embedded web layer only w
 </table>
 
 Unsupported platform hosts reject with the standard unsupported-service error.
+
+## Audio input preview
+
+Audio input is a stream primitive, not a recorder: Native supplies source discovery and selection, one active input session, compact lifecycle/device events, and a timestamped PCM callback. The callback receives borrowed interleaved <code>f32</code> samples; copy or enqueue them immediately. It must not block, allocate, or re-enter the UI/effects loop. Recording files, voice activity detection, transcription, mixing, and echo cancellation remain application policy.
+
+The first host implementation is intentionally narrow: macOS with the system WebView, through the Native application API above. The Native bridge is not a second media-stream transport: raw microphone data never becomes a JSON bridge message or a <code>window.zero</code> event. WebView <code>getUserMedia()</code> origin policy is a separate browser-facing feature, not an alias for this direct PCM sink. Chromium support and Windows/Linux implementations are not part of this preview.
 
 ## Audio streaming and the track cache
 

@@ -2,6 +2,8 @@
 
 #import <AppKit/AppKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <AudioToolbox/AudioToolbox.h>
+#import <CoreAudio/CoreAudio.h>
 /* Spectrum analysis of the app's own playback: MediaToolbox provides
  * the MTAudioProcessingTap that hands the player's PCM to the host, and
  * Accelerate (vDSP) provides the FFT that turns it into band
@@ -30,6 +32,10 @@ static const NSUInteger NativeSdkMaxChildWebViews = 16;
 static const NSUInteger NativeSdkMaxNativeViews = 32;
 static const NSInteger NativeSdkBridgeFrameKeepaliveFrames = 600;
 static const uint64_t NativeSdkNanosecondsPerSecond = 1000000000ull;
+/* One input tap callback must never allocate. Stereo, 16k-frame hardware
+ * buffers are already unusually large; an over-cap frame is reported through
+ * the dropped counter rather than risking a realtime allocation. */
+static const NSUInteger NativeSdkMaxAudioInputSamples = 32768;
 static const uint32_t NativeSdkShortcutModifierPrimary = 1u << 0;
 static const uint32_t NativeSdkShortcutModifierCommand = 1u << 1;
 static const uint32_t NativeSdkShortcutModifierControl = 1u << 2;
@@ -72,6 +78,80 @@ static NSString *NativeSdkStringFromTextInput(id value);
 static int NativeSdkAppKitColorSchemeForAppearance(NSAppearance *appearance);
 static BOOL NativeSdkAppKitReduceMotionEnabled(void);
 static BOOL NativeSdkAppKitHighContrastEnabled(void);
+
+static AudioDeviceID NativeSdkDefaultAudioInputDevice(void) {
+    AudioDeviceID device = kAudioObjectUnknown;
+    UInt32 size = sizeof(device);
+    AudioObjectPropertyAddress address = {
+        .mSelector = kAudioHardwarePropertyDefaultInputDevice,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, NULL, &size, &device) != noErr) return kAudioObjectUnknown;
+    return device;
+}
+
+static BOOL NativeSdkAudioDeviceHasInput(AudioDeviceID device) {
+    AudioObjectPropertyAddress address = {
+        .mSelector = kAudioDevicePropertyStreamConfiguration,
+        .mScope = kAudioDevicePropertyScopeInput,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(device, &address, 0, NULL, &size) != noErr || size < sizeof(AudioBufferList)) return NO;
+    AudioBufferList *buffers = malloc(size);
+    if (!buffers) return NO;
+    OSStatus status = AudioObjectGetPropertyData(device, &address, 0, NULL, &size, buffers);
+    UInt32 channels = 0;
+    if (status == noErr) {
+        for (UInt32 index = 0; index < buffers->mNumberBuffers; index += 1) channels += buffers->mBuffers[index].mNumberChannels;
+    }
+    free(buffers);
+    return channels > 0;
+}
+
+static NSString *NativeSdkAudioDeviceString(AudioDeviceID device, AudioObjectPropertySelector selector) {
+    AudioObjectPropertyAddress address = {
+        .mSelector = selector,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    CFStringRef value = NULL;
+    UInt32 size = sizeof(value);
+    if (AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &value) != noErr || !value) return nil;
+    return [(__bridge NSString *)value copy];
+}
+
+static AudioDeviceID NativeSdkAudioInputDeviceForUID(NSString *uid) {
+    if (uid.length == 0) return NativeSdkDefaultAudioInputDevice();
+    AudioObjectPropertyAddress devicesAddress = {
+        .mSelector = kAudioHardwarePropertyDevices,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &devicesAddress, 0, NULL, &size) != noErr || size == 0) return kAudioObjectUnknown;
+    AudioDeviceID *devices = malloc(size);
+    if (!devices) return kAudioObjectUnknown;
+    AudioDeviceID result = kAudioObjectUnknown;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &devicesAddress, 0, NULL, &size, devices) == noErr) {
+        const NSUInteger count = size / sizeof(AudioDeviceID);
+        for (NSUInteger index = 0; index < count; index += 1) {
+            if (!NativeSdkAudioDeviceHasInput(devices[index])) continue;
+            NSString *candidate = NativeSdkAudioDeviceString(devices[index], kAudioDevicePropertyDeviceUID);
+            if ([candidate isEqualToString:uid]) {
+                result = devices[index];
+                break;
+            }
+        }
+    }
+    free(devices);
+    return result;
+}
+
+static uint64_t NativeSdkAudioHostTimeNanoseconds(uint64_t hostTime) {
+    return hostTime == 0 ? NativeSdkTimestampNanoseconds() : AudioConvertHostTimeToNanos(hostTime);
+}
 
 static size_t NativeSdkOverflowSize(size_t buffer_len) {
     return buffer_len == SIZE_MAX ? SIZE_MAX : buffer_len + 1;
@@ -755,6 +835,29 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 @property(nonatomic, assign) uint64_t audioSpectrumLastWritten;
 @property(nonatomic, assign) uint64_t audioSpectrumFreshNs;
 @property(nonatomic, assign) FFTSetup audioSpectrumFft;
+/* The independent microphone capture path. It intentionally does not
+ * share AVPlayer or its spectrum tap: playback owns an output graph while
+ * this engine owns one input tap and calls the app's PCM consumer directly. */
+@property(nonatomic, strong) AVAudioEngine *audioInputEngine;
+@property(nonatomic, strong) id audioInputEngineConfigurationObserver;
+@property(nonatomic, assign) native_sdk_appkit_audio_input_callback_t audioInputCallback;
+@property(nonatomic, assign) void *audioInputContext;
+@property(nonatomic, assign) uint64_t audioInputSessionId;
+@property(nonatomic, strong) NSString *audioInputRequestedDeviceUID;
+@property(nonatomic, strong) NSString *audioInputActiveDeviceUID;
+@property(nonatomic, assign) BOOL audioInputFollowsSystemDefault;
+@property(nonatomic, assign) uint32_t audioInputRequestedSampleRate;
+@property(nonatomic, assign) uint8_t audioInputRequestedChannels;
+@property(nonatomic, assign) uint64_t audioInputNextSequence;
+@property(nonatomic, assign) uint64_t audioInputDroppedFrames;
+@property(nonatomic, assign) BOOL audioInputDiscontinuity;
+@property(nonatomic, assign) uint64_t audioInputDeviceGeneration;
+@property(nonatomic, assign) BOOL audioInputDeviceListenersInstalled;
+@property(nonatomic, assign) float *audioInputInterleavedScratch;
+/// The runtime forwards the manifest's microphone grant through its existing
+/// security-policy handshake. Direct capture never asks the OS when an app
+/// did not declare this capability.
+@property(nonatomic, assign) BOOL audioInputManifestAllowed;
 /* The cache fill: a parallel download of the same URL, installed at
  * the cache path only after an atomic size-verified rename. Cancelled
  * when a new load replaces the stream; orphaned (left to finish) when
@@ -918,6 +1021,15 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 - (void)stopAudioSpectrumTimer;
 - (BOOL)anyHostWindowVisibleOnGlass;
 - (void)audioSpectrumTimerFired:(NSTimer *)timer;
+- (NSUInteger)audioInputListDevices:(native_sdk_appkit_audio_input_device_t *)devices capacity:(NSUInteger)capacity generation:(uint64_t *)generation;
+- (int)audioInputStartWithSession:(uint64_t)sessionId deviceUID:(NSString *)deviceUID sampleRate:(uint32_t)sampleRate channels:(uint8_t)channels callback:(native_sdk_appkit_audio_input_callback_t)callback context:(void *)context;
+- (void)audioInputBeginWithEventKind:(int)eventKind;
+- (void)audioInputStopEmitting:(BOOL)emitStopped;
+- (void)audioInputDidChangeDevices;
+- (void)audioInputEngineConfigurationChanged;
+- (void)emitAudioInputEventOfKind:(int)kind sampleRate:(uint32_t)sampleRate channels:(uint8_t)channels;
+- (void)installAudioInputDeviceListeners;
+- (void)removeAudioInputDeviceListeners;
 - (void)wakeFromAnyThread;
 - (void)scheduleBridgeFrames;
 - (void)emitFrame;
@@ -937,6 +1049,21 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 - (BOOL)handleShortcutEvent:(NSEvent *)event;
 - (void)emitShortcutWithId:(NSString *)identifier key:(NSString *)key modifiers:(uint32_t)modifiers event:(NSEvent *)event;
 @end
+
+/* Core Audio can deliver this on an arbitrary listener thread. The AppKit
+ * host owns lifecycle control on its main loop, so coalesce the work there
+ * and retain nothing beyond the weak hop. */
+static OSStatus NativeSdkAudioInputDevicePropertyListener(AudioObjectID object, UInt32 addressCount, const AudioObjectPropertyAddress addresses[], void *context) {
+    (void)object;
+    (void)addressCount;
+    (void)addresses;
+    NativeSdkAppKitHost *host = (__bridge NativeSdkAppKitHost *)context;
+    __weak NativeSdkAppKitHost *weakHost = host;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [weakHost audioInputDidChangeDevices];
+    });
+    return noErr;
+}
 
 // Recursively re-emit the gpu-surface resize event for every metal
 // surface under `view` (the tall-titlebar chrome re-query path).
@@ -6746,6 +6873,8 @@ static double NativeSdkClampedPinchMagnification(double magnification) {
     self.nativeViewExplicitTextKeys = [[NSMutableSet alloc] init];
     self.bridgeEnabledChildWebViewKeys = [[NSMutableSet alloc] init];
     self.appTimers = [[NSMutableDictionary alloc] init];
+    self.audioInputDeviceGeneration = 1;
+    [self installAudioInputDeviceListeners];
     self.allowedNavigationOrigins = @[ @"zero://app", @"zero://inline" ];
     self.allowedExternalURLs = @[];
     self.externalLinkAction = 0;
@@ -6933,6 +7062,12 @@ static double NativeSdkClampedPinchMagnification(double magnification) {
 - (void)dealloc {
     [self invalidateAppTimers];
     [self audioStop];
+    [self audioInputStopEmitting:NO];
+    [self removeAudioInputDeviceListeners];
+    if (self.audioInputInterleavedScratch) {
+        free(self.audioInputInterleavedScratch);
+        self.audioInputInterleavedScratch = NULL;
+    }
     /* The vDSP plan outlives individual playbacks (created lazily
      * once); the host's end is where it retires. */
     if (self.audioSpectrumFft) {
@@ -9732,6 +9867,302 @@ static int NativeSdkSpectrumComputeBands(native_sdk_spectrum_tap_state_t *state,
     return 1;
 }
 
+/* ---------------------------------------------------- audio input
+ *
+ * This is deliberately a capture primitive, not a recorder: Core Audio
+ * enumerates opaque input UIDs, AVAudioEngine owns one selected/default
+ * device, and the tap hands borrowed float PCM directly to an app callback.
+ * Control reports remain on the AppKit event loop; no raw samples enter the
+ * bridge, runtime queue, effects queue, or journal.
+ */
+
+- (NSUInteger)audioInputListDevices:(native_sdk_appkit_audio_input_device_t *)devices capacity:(NSUInteger)capacity generation:(uint64_t *)generation {
+    if (generation) *generation = self.audioInputDeviceGeneration;
+    if (!devices || capacity == 0) return 0;
+    AudioObjectPropertyAddress address = {
+        .mSelector = kAudioHardwarePropertyDevices,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    UInt32 byteCount = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &address, 0, NULL, &byteCount) != noErr || byteCount == 0) return 0;
+    AudioDeviceID *deviceIds = malloc(byteCount);
+    if (!deviceIds) return 0;
+    NSUInteger written = 0;
+    const AudioDeviceID defaultDevice = NativeSdkDefaultAudioInputDevice();
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, NULL, &byteCount, deviceIds) == noErr) {
+        const NSUInteger count = byteCount / sizeof(AudioDeviceID);
+        for (NSUInteger index = 0; index < count && written < capacity; index += 1) {
+            const AudioDeviceID device = deviceIds[index];
+            if (!NativeSdkAudioDeviceHasInput(device)) continue;
+            NSString *uid = NativeSdkAudioDeviceString(device, kAudioDevicePropertyDeviceUID);
+            if (uid.length == 0) continue;
+            NSString *name = NativeSdkAudioDeviceString(device, kAudioObjectPropertyName) ?: @"Input device";
+            NSData *uidData = [uid dataUsingEncoding:NSUTF8StringEncoding];
+            NSData *nameData = [name dataUsingEncoding:NSUTF8StringEncoding];
+            if (uidData.length == 0 || uidData.length > NATIVE_SDK_APPKIT_AUDIO_INPUT_DEVICE_ID_BYTES || nameData.length > NATIVE_SDK_APPKIT_AUDIO_INPUT_DEVICE_LABEL_BYTES) continue;
+            native_sdk_appkit_audio_input_device_t *entry = &devices[written];
+            memset(entry, 0, sizeof(*entry));
+            memcpy(entry->id, uidData.bytes, uidData.length);
+            entry->id_len = uidData.length;
+            memcpy(entry->label, nameData.bytes, nameData.length);
+            entry->label_len = nameData.length;
+            entry->is_default = device == defaultDevice ? 1 : 0;
+            written += 1;
+        }
+    }
+    free(deviceIds);
+    return written;
+}
+
+- (void)installAudioInputDeviceListeners {
+    if (self.audioInputDeviceListenersInstalled) return;
+    AudioObjectPropertyAddress devicesAddress = {
+        .mSelector = kAudioHardwarePropertyDevices,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    AudioObjectPropertyAddress defaultAddress = {
+        .mSelector = kAudioHardwarePropertyDefaultInputDevice,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    const OSStatus devicesStatus = AudioObjectAddPropertyListener(kAudioObjectSystemObject, &devicesAddress, NativeSdkAudioInputDevicePropertyListener, (__bridge void *)self);
+    const OSStatus defaultStatus = AudioObjectAddPropertyListener(kAudioObjectSystemObject, &defaultAddress, NativeSdkAudioInputDevicePropertyListener, (__bridge void *)self);
+    self.audioInputDeviceListenersInstalled = devicesStatus == noErr && defaultStatus == noErr;
+    if (!self.audioInputDeviceListenersInstalled && devicesStatus == noErr) {
+        AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &devicesAddress, NativeSdkAudioInputDevicePropertyListener, (__bridge void *)self);
+    }
+}
+
+- (void)removeAudioInputDeviceListeners {
+    if (!self.audioInputDeviceListenersInstalled) return;
+    AudioObjectPropertyAddress devicesAddress = {
+        .mSelector = kAudioHardwarePropertyDevices,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    AudioObjectPropertyAddress defaultAddress = {
+        .mSelector = kAudioHardwarePropertyDefaultInputDevice,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &devicesAddress, NativeSdkAudioInputDevicePropertyListener, (__bridge void *)self);
+    AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &defaultAddress, NativeSdkAudioInputDevicePropertyListener, (__bridge void *)self);
+    self.audioInputDeviceListenersInstalled = NO;
+}
+
+- (void)emitAudioInputEventOfKind:(int)kind sampleRate:(uint32_t)sampleRate channels:(uint8_t)channels {
+    [self emitEvent:(native_sdk_appkit_event_t){
+        .kind = NATIVE_SDK_APPKIT_EVENT_AUDIO_INPUT,
+        .timestamp_ns = NativeSdkTimestampNanoseconds(),
+        .audio_input_session_id = self.audioInputSessionId,
+        .audio_input_kind = kind,
+        .audio_input_sample_rate_hz = sampleRate,
+        .audio_input_channels = channels,
+        .audio_input_device_generation = self.audioInputDeviceGeneration,
+        .audio_input_dropped_frames = self.audioInputDroppedFrames,
+    }];
+}
+
+- (int)audioInputStartWithSession:(uint64_t)sessionId deviceUID:(NSString *)deviceUID sampleRate:(uint32_t)sampleRate channels:(uint8_t)channels callback:(native_sdk_appkit_audio_input_callback_t)callback context:(void *)context {
+    if (!callback || sessionId == 0 || channels == 0 || channels > 2) return 1;
+    [self audioInputStopEmitting:NO];
+    self.audioInputCallback = callback;
+    self.audioInputContext = context;
+    self.audioInputSessionId = sessionId;
+    self.audioInputRequestedDeviceUID = deviceUID ?: @"";
+    self.audioInputFollowsSystemDefault = self.audioInputRequestedDeviceUID.length == 0;
+    self.audioInputRequestedSampleRate = sampleRate;
+    self.audioInputRequestedChannels = channels;
+    self.audioInputNextSequence = 0;
+    self.audioInputDroppedFrames = 0;
+    self.audioInputDiscontinuity = YES;
+
+    if (!self.audioInputManifestAllowed) {
+        [self emitAudioInputEventOfKind:NATIVE_SDK_APPKIT_AUDIO_INPUT_PERMISSION_DENIED sampleRate:0 channels:0];
+        [self audioInputStopEmitting:NO];
+        return 0;
+    }
+
+    const AVAuthorizationStatus authorization = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
+    if (authorization == AVAuthorizationStatusDenied || authorization == AVAuthorizationStatusRestricted) {
+        [self emitAudioInputEventOfKind:NATIVE_SDK_APPKIT_AUDIO_INPUT_PERMISSION_DENIED sampleRate:0 channels:0];
+        [self audioInputStopEmitting:NO];
+        return 0;
+    }
+    if (authorization == AVAuthorizationStatusNotDetermined) {
+        __weak NativeSdkAppKitHost *weakSelf = self;
+        [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL granted) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NativeSdkAppKitHost *strongSelf = weakSelf;
+                if (!strongSelf || strongSelf.audioInputSessionId != sessionId) return;
+                if (!granted) {
+                    [strongSelf emitAudioInputEventOfKind:NATIVE_SDK_APPKIT_AUDIO_INPUT_PERMISSION_DENIED sampleRate:0 channels:0];
+                    [strongSelf audioInputStopEmitting:NO];
+                    return;
+                }
+                [strongSelf audioInputBeginWithEventKind:NATIVE_SDK_APPKIT_AUDIO_INPUT_STARTED];
+            });
+        }];
+        return 0;
+    }
+    [self audioInputBeginWithEventKind:NATIVE_SDK_APPKIT_AUDIO_INPUT_STARTED];
+    return 0;
+}
+
+- (void)audioInputBeginWithEventKind:(int)eventKind {
+    if (!self.audioInputCallback || self.audioInputSessionId == 0) return;
+    const AudioDeviceID device = NativeSdkAudioInputDeviceForUID(self.audioInputRequestedDeviceUID);
+    if (device == kAudioObjectUnknown || !NativeSdkAudioDeviceHasInput(device)) {
+        [self emitAudioInputEventOfKind:NATIVE_SDK_APPKIT_AUDIO_INPUT_FAILED sampleRate:0 channels:0];
+        [self audioInputStopEmitting:NO];
+        return;
+    }
+    NSString *activeUID = NativeSdkAudioDeviceString(device, kAudioDevicePropertyDeviceUID);
+    AVAudioEngine *engine = [[AVAudioEngine alloc] init];
+    AVAudioInputNode *input = engine.inputNode;
+    AudioUnit unit = input.audioUnit;
+    if (!unit || AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, sizeof(device)) != noErr) {
+        [self emitAudioInputEventOfKind:NATIVE_SDK_APPKIT_AUDIO_INPUT_FAILED sampleRate:0 channels:0];
+        [self audioInputStopEmitting:NO];
+        return;
+    }
+    AVAudioFormat *format = [input inputFormatForBus:0];
+    const uint32_t actualRate = format.sampleRate > 0 ? (uint32_t)llround(format.sampleRate) : 0;
+    const uint8_t actualChannels = (uint8_t)MIN((AVAudioChannelCount)self.audioInputRequestedChannels, format.channelCount);
+    if (actualRate == 0 || actualChannels == 0 || format.commonFormat != AVAudioPCMFormatFloat32) {
+        [self emitAudioInputEventOfKind:NATIVE_SDK_APPKIT_AUDIO_INPUT_FAILED sampleRate:0 channels:0];
+        [self audioInputStopEmitting:NO];
+        return;
+    }
+    if (!self.audioInputInterleavedScratch) {
+        self.audioInputInterleavedScratch = malloc(sizeof(float) * NativeSdkMaxAudioInputSamples);
+        if (!self.audioInputInterleavedScratch) {
+            [self emitAudioInputEventOfKind:NATIVE_SDK_APPKIT_AUDIO_INPUT_FAILED sampleRate:0 channels:0];
+            [self audioInputStopEmitting:NO];
+            return;
+        }
+    }
+    __weak NativeSdkAppKitHost *weakSelf = self;
+    [input installTapOnBus:0 bufferSize:1024 format:nil block:^(AVAudioPCMBuffer *buffer, AVAudioTime *when) {
+        NativeSdkAppKitHost *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        native_sdk_appkit_audio_input_callback_t frameCallback = strongSelf.audioInputCallback;
+        if (!frameCallback) return;
+        const uint32_t frameRate = buffer.format.sampleRate > 0 ? (uint32_t)llround(buffer.format.sampleRate) : 0;
+        const uint8_t channels = (uint8_t)MIN((uint32_t)strongSelf.audioInputRequestedChannels, (uint32_t)buffer.format.channelCount);
+        const NSUInteger frames = buffer.frameLength;
+        const NSUInteger sampleCount = frames * channels;
+        float *const *channelData = buffer.floatChannelData;
+        if (!channelData || frameRate == 0 || sampleCount == 0 || sampleCount > NativeSdkMaxAudioInputSamples) {
+            strongSelf.audioInputDroppedFrames += frames;
+            return;
+        }
+        const float *samples = channelData[0];
+        if (!buffer.format.isInterleaved && channels > 1) {
+            for (NSUInteger frame = 0; frame < frames; frame += 1) {
+                for (uint8_t channel = 0; channel < channels; channel += 1) {
+                    strongSelf.audioInputInterleavedScratch[frame * channels + channel] = channelData[channel][frame];
+                }
+            }
+            samples = strongSelf.audioInputInterleavedScratch;
+        }
+        const BOOL discontinuity = strongSelf.audioInputDiscontinuity;
+        strongSelf.audioInputDiscontinuity = NO;
+        strongSelf.audioInputNextSequence += 1;
+        frameCallback(strongSelf.audioInputContext, samples, sampleCount, strongSelf.audioInputNextSequence, NativeSdkAudioHostTimeNanoseconds(when.hostTime), frameRate, channels, discontinuity ? 1 : 0, strongSelf.audioInputDroppedFrames);
+    }];
+    NSError *error = nil;
+    if (![engine startAndReturnError:&error]) {
+        [input removeTapOnBus:0];
+        [self emitAudioInputEventOfKind:NATIVE_SDK_APPKIT_AUDIO_INPUT_FAILED sampleRate:actualRate channels:actualChannels];
+        [self audioInputStopEmitting:NO];
+        return;
+    }
+    self.audioInputEngine = engine;
+    self.audioInputActiveDeviceUID = activeUID;
+    __weak NativeSdkAppKitHost *configurationWeakSelf = self;
+    self.audioInputEngineConfigurationObserver = [[NSNotificationCenter defaultCenter]
+        addObserverForName:AVAudioEngineConfigurationChangeNotification
+                    object:engine
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *note) {
+                    (void)note;
+                    [configurationWeakSelf audioInputEngineConfigurationChanged];
+                }];
+    [self emitAudioInputEventOfKind:eventKind sampleRate:actualRate channels:actualChannels];
+}
+
+- (void)audioInputStopEmitting:(BOOL)emitStopped {
+    const uint64_t sessionId = self.audioInputSessionId;
+    const uint64_t droppedFrames = self.audioInputDroppedFrames;
+    AVAudioEngine *engine = self.audioInputEngine;
+    if (self.audioInputEngineConfigurationObserver) {
+        [[NSNotificationCenter defaultCenter] removeObserver:self.audioInputEngineConfigurationObserver];
+        self.audioInputEngineConfigurationObserver = nil;
+    }
+    if (engine) {
+        [engine.inputNode removeTapOnBus:0];
+        [engine stop];
+    }
+    self.audioInputEngine = nil;
+    self.audioInputCallback = NULL;
+    self.audioInputContext = NULL;
+    self.audioInputSessionId = 0;
+    self.audioInputRequestedDeviceUID = nil;
+    self.audioInputActiveDeviceUID = nil;
+    self.audioInputNextSequence = 0;
+    self.audioInputDroppedFrames = 0;
+    self.audioInputDiscontinuity = NO;
+    if (emitStopped && sessionId != 0) {
+        [self emitEvent:(native_sdk_appkit_event_t){
+            .kind = NATIVE_SDK_APPKIT_EVENT_AUDIO_INPUT,
+            .timestamp_ns = NativeSdkTimestampNanoseconds(),
+            .audio_input_session_id = sessionId,
+            .audio_input_kind = NATIVE_SDK_APPKIT_AUDIO_INPUT_STOPPED,
+            .audio_input_device_generation = self.audioInputDeviceGeneration,
+            .audio_input_dropped_frames = droppedFrames,
+        }];
+    }
+}
+
+- (void)audioInputEngineConfigurationChanged {
+    AVAudioEngine *engine = self.audioInputEngine;
+    if (!engine || self.audioInputSessionId == 0) return;
+    AVAudioFormat *format = [engine.inputNode inputFormatForBus:0];
+    const uint32_t sampleRate = format.sampleRate > 0 ? (uint32_t)llround(format.sampleRate) : 0;
+    const uint8_t channels = (uint8_t)MIN((uint32_t)self.audioInputRequestedChannels, (uint32_t)format.channelCount);
+    self.audioInputDiscontinuity = YES;
+    [self emitAudioInputEventOfKind:NATIVE_SDK_APPKIT_AUDIO_INPUT_FORMAT_CHANGED sampleRate:sampleRate channels:channels];
+}
+
+- (void)audioInputDidChangeDevices {
+    self.audioInputDeviceGeneration += 1;
+    if (self.audioInputDeviceGeneration == 0) self.audioInputDeviceGeneration = 1;
+    if (self.audioInputSessionId == 0) return;
+    [self emitAudioInputEventOfKind:NATIVE_SDK_APPKIT_AUDIO_INPUT_DEVICES_CHANGED sampleRate:0 channels:0];
+    // An app is allowed to stop/restart from the control callback above.
+    // Do not mutate that replacement session based on a stale listener turn.
+    if (self.audioInputSessionId == 0) return;
+    if (self.audioInputFollowsSystemDefault) {
+        const AudioDeviceID currentDefault = NativeSdkDefaultAudioInputDevice();
+        NSString *currentUID = currentDefault == kAudioObjectUnknown ? nil : NativeSdkAudioDeviceString(currentDefault, kAudioDevicePropertyDeviceUID);
+        if (currentUID.length == 0 || [currentUID isEqualToString:self.audioInputActiveDeviceUID]) return;
+        AVAudioEngine *engine = self.audioInputEngine;
+        [engine.inputNode removeTapOnBus:0];
+        [engine stop];
+        self.audioInputEngine = nil;
+        self.audioInputDiscontinuity = YES;
+        [self audioInputBeginWithEventKind:NATIVE_SDK_APPKIT_AUDIO_INPUT_SOURCE_CHANGED];
+        return;
+    }
+    if (NativeSdkAudioInputDeviceForUID(self.audioInputActiveDeviceUID) == kAudioObjectUnknown) {
+        [self emitAudioInputEventOfKind:NATIVE_SDK_APPKIT_AUDIO_INPUT_DEVICE_LOST sampleRate:0 channels:0];
+        [self audioInputStopEmitting:NO];
+    }
+}
+
 - (void)scheduleBridgeFrames {
     self.bridgeFrameKeepalive = NativeSdkBridgeFrameKeepaliveFrames;
     [self scheduleFrame];
@@ -10321,6 +10752,26 @@ int native_sdk_appkit_audio_set_volume(native_sdk_appkit_host_t *host, double vo
     return [object audioSetVolume:volume];
 }
 
+size_t native_sdk_appkit_audio_input_list_devices(native_sdk_appkit_host_t *host, native_sdk_appkit_audio_input_device_t *devices, size_t capacity, uint64_t *generation) {
+    NativeSdkAppKitHost *object = (__bridge NativeSdkAppKitHost *)host;
+    return [object audioInputListDevices:devices capacity:capacity generation:generation];
+}
+
+int native_sdk_appkit_audio_input_start(native_sdk_appkit_host_t *host, uint64_t session_id, const char *device_id, size_t device_id_len, uint32_t sample_rate_hz, uint8_t channels, native_sdk_appkit_audio_input_callback_t callback, void *context) {
+    NativeSdkAppKitHost *object = (__bridge NativeSdkAppKitHost *)host;
+    NSString *deviceUID = @"";
+    if (device_id_len > 0) {
+        deviceUID = [[NSString alloc] initWithBytes:device_id length:device_id_len encoding:NSUTF8StringEncoding];
+        if (!deviceUID) return 1;
+    }
+    return [object audioInputStartWithSession:session_id deviceUID:deviceUID sampleRate:sample_rate_hz channels:channels callback:callback context:context];
+}
+
+void native_sdk_appkit_audio_input_stop(native_sdk_appkit_host_t *host) {
+    NativeSdkAppKitHost *object = (__bridge NativeSdkAppKitHost *)host;
+    [object audioInputStopEmitting:YES];
+}
+
 void native_sdk_appkit_wake(native_sdk_appkit_host_t *host) {
     NativeSdkAppKitHost *object = (__bridge NativeSdkAppKitHost *)host;
     [object wakeFromAnyThread];
@@ -10431,11 +10882,12 @@ void native_sdk_appkit_emit_window_event(native_sdk_appkit_host_t *host, uint64_
     [object emitEventNamed:nameString ?: @"" detailJSON:detailString ?: @"null" windowId:window_id];
 }
 
-void native_sdk_appkit_set_security_policy(native_sdk_appkit_host_t *host, const char *allowed_origins, size_t allowed_origins_len, const char *external_urls, size_t external_urls_len, int external_action) {
+void native_sdk_appkit_set_security_policy(native_sdk_appkit_host_t *host, const char *allowed_origins, size_t allowed_origins_len, const char *external_urls, size_t external_urls_len, int external_action, int microphone_allowed) {
     NativeSdkAppKitHost *object = (__bridge NativeSdkAppKitHost *)host;
     NSArray<NSString *> *origins = NativeSdkPolicyListFromBytes(allowed_origins, allowed_origins_len, @[ @"zero://app", @"zero://inline" ]);
     NSArray<NSString *> *externalURLs = NativeSdkPolicyListFromBytes(external_urls, external_urls_len, @[]);
     [object setAllowedNavigationOrigins:origins externalURLs:externalURLs externalAction:external_action];
+    object.audioInputManifestAllowed = microphone_allowed != 0;
 }
 
 void native_sdk_appkit_set_menus(native_sdk_appkit_host_t *host, const char *const *menu_titles, const size_t *menu_title_lens, size_t menu_count, const uint32_t *item_menu_indices, const char *const *item_labels, const size_t *item_label_lens, const char *const *item_commands, const size_t *item_command_lens, const char *const *item_keys, const size_t *item_key_lens, const uint32_t *item_modifiers, const int *item_separators, const int *item_enabled, const int *item_checked, size_t item_count) {

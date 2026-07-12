@@ -2820,6 +2820,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 .audio => |audio_event| if (self.effects.takeAudioMsg(audio_event)) |msg| {
                     try self.dispatch(runtime, self.canvas_window_id, msg);
                 },
+                .audio_input => |audio_input_event| if (self.effects.takeAudioInputMsg(audio_input_event)) |msg| {
+                    try self.dispatch(runtime, self.canvas_window_id, msg);
+                },
                 .effects_wake => try self.drainEffects(runtime),
                 .gpu_surface_frame => |frame_event| try self.handleFrame(runtime, frame_event),
                 .gpu_surface_resized => |resize_event| try self.handleResize(runtime, resize_event),

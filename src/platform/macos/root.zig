@@ -39,6 +39,7 @@ const AppKitEventKind = enum(c_int) {
     gpu_surface_scroll_driver = 18,
     context_menu_action = 19,
     audio = 20,
+    audio_input = 21,
 };
 
 const AppKitEvent = extern struct {
@@ -117,10 +118,27 @@ const AppKitEvent = extern struct {
     /// documented scale (log-spaced 50 Hz..16 kHz buckets, linear-in-dB
     /// from -60 dBFS at 0 to full scale at 255). Zeros elsewhere.
     audio_bands: [platform_mod.audio_spectrum_band_count]u8,
+    /// Control-plane payload for real-time microphone capture. PCM frames
+    /// use the separate C callback and never enter the AppKit event loop.
+    audio_input_session_id: u64,
+    audio_input_kind: c_int,
+    audio_input_sample_rate_hz: u32,
+    audio_input_channels: u8,
+    audio_input_device_generation: u64,
+    audio_input_dropped_frames: u64,
 };
 
 const AppKitCallback = *const fn (context: ?*anyopaque, event: *const AppKitEvent) callconv(.c) void;
 const AppKitBridgeCallback = *const fn (context: ?*anyopaque, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, message: [*]const u8, message_len: usize, origin: [*]const u8, origin_len: usize) callconv(.c) void;
+const AppKitAudioInputCallback = *const fn (context: ?*anyopaque, samples: [*]const f32, sample_count: usize, sequence: u64, timestamp_ns: u64, sample_rate_hz: u32, channels: u8, discontinuity: c_int, dropped_frames: u64) callconv(.c) void;
+
+const AppKitAudioInputDevice = extern struct {
+    id_storage: [platform_mod.max_audio_input_device_id_bytes]u8,
+    id_len: usize,
+    label_storage: [platform_mod.max_audio_input_device_label_bytes]u8,
+    label_len: usize,
+    is_default: c_int,
+};
 
 const shortcut_modifier_primary: u32 = 1 << 0;
 const shortcut_modifier_command: u32 = 1 << 1;
@@ -142,7 +160,7 @@ extern fn native_sdk_appkit_bridge_respond(host: *AppKitHost, response: [*]const
 extern fn native_sdk_appkit_bridge_respond_window(host: *AppKitHost, window_id: u64, response: [*]const u8, response_len: usize) void;
 extern fn native_sdk_appkit_bridge_respond_webview(host: *AppKitHost, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, response: [*]const u8, response_len: usize) void;
 extern fn native_sdk_appkit_emit_window_event(host: *AppKitHost, window_id: u64, name: [*]const u8, name_len: usize, detail_json: [*]const u8, detail_json_len: usize) void;
-extern fn native_sdk_appkit_set_security_policy(host: *AppKitHost, allowed_origins: [*]const u8, allowed_origins_len: usize, external_urls: [*]const u8, external_urls_len: usize, external_action: c_int) void;
+extern fn native_sdk_appkit_set_security_policy(host: *AppKitHost, allowed_origins: [*]const u8, allowed_origins_len: usize, external_urls: [*]const u8, external_urls_len: usize, external_action: c_int, microphone_allowed: c_int) void;
 extern fn native_sdk_appkit_set_menus(host: *AppKitHost, menu_titles: [*]const [*]const u8, menu_title_lens: [*]const usize, menu_count: usize, item_menu_indices: [*]const u32, item_labels: [*]const [*]const u8, item_label_lens: [*]const usize, item_commands: [*]const [*]const u8, item_command_lens: [*]const usize, item_keys: [*]const [*]const u8, item_key_lens: [*]const usize, item_modifiers: [*]const u32, item_separators: [*]const c_int, item_enabled: [*]const c_int, item_checked: [*]const c_int, item_count: usize) void;
 extern fn native_sdk_appkit_set_shortcuts(host: *AppKitHost, ids: [*]const [*]const u8, id_lens: [*]const usize, keys: [*]const [*]const u8, key_lens: [*]const usize, modifiers: [*]const u32, count: usize) void;
 extern fn native_sdk_appkit_request_frame(host: *AppKitHost) void;
@@ -177,6 +195,9 @@ extern fn native_sdk_appkit_audio_pause(host: *AppKitHost) c_int;
 extern fn native_sdk_appkit_audio_stop(host: *AppKitHost) c_int;
 extern fn native_sdk_appkit_audio_seek(host: *AppKitHost, position_ms: u64) c_int;
 extern fn native_sdk_appkit_audio_set_volume(host: *AppKitHost, volume: f64) c_int;
+extern fn native_sdk_appkit_audio_input_list_devices(host: *AppKitHost, devices: [*]AppKitAudioInputDevice, capacity: usize, generation: *u64) usize;
+extern fn native_sdk_appkit_audio_input_start(host: *AppKitHost, session_id: u64, device_id: [*]const u8, device_id_len: usize, sample_rate_hz: u32, channels: u8, callback: AppKitAudioInputCallback, context: ?*anyopaque) c_int;
+extern fn native_sdk_appkit_audio_input_stop(host: *AppKitHost) void;
 extern fn native_sdk_appkit_wake(host: *AppKitHost) void;
 extern fn native_sdk_appkit_present_gpu_surface_pixels(host: *AppKitHost, window_id: u64, label: [*]const u8, label_len: usize, width: usize, height: usize, scale: f64, has_dirty_rect: c_int, dirty_x: f64, dirty_y: f64, dirty_width: f64, dirty_height: f64, rgba8: [*]const u8, rgba8_len: usize) c_int;
 extern fn native_sdk_appkit_present_gpu_surface_packet(host: *AppKitHost, window_id: u64, label: [*]const u8, label_len: usize, surface_width: f64, surface_height: f64, scale: f64, clear_r: u8, clear_g: u8, clear_b: u8, clear_a: u8, requires_render: c_int, command_count: usize, unsupported_command_count: usize, representable: c_int, json: [*]const u8, json_len: usize) c_int;
@@ -516,6 +537,10 @@ pub const MacPlatform = struct {
     app_info: platform_mod.AppInfo,
     surface_value: platform_mod.Surface,
     state: RunState = .{},
+    /// Borrowed app-owned sink set while an input session is active. The
+    /// AppKit host calls it from the audio thread; no PCM is routed through
+    /// `state` or the platform event callback.
+    audio_input_sink: ?platform_mod.AudioInputSink = null,
 
     pub fn init(title: []const u8, size: geometry.SizeF) Error!MacPlatform {
         return initWithEngine(title, size, .system);
@@ -641,6 +666,9 @@ pub const MacPlatform = struct {
                 .audio_stop_fn = audioStop,
                 .audio_seek_fn = audioSeek,
                 .audio_set_volume_fn = audioSetVolume,
+                .audio_input_list_devices_fn = if (self.web_engine == .system) audioInputListDevices else null,
+                .audio_input_start_fn = if (self.web_engine == .system) audioInputStart else null,
+                .audio_input_stop_fn = if (self.web_engine == .system) audioInputStop else null,
                 .wake_fn = wake,
                 .request_frame_fn = requestFrame,
                 .request_gpu_surface_frame_fn = requestGpuSurfaceFrame,
@@ -703,6 +731,7 @@ pub const MacPlatform = struct {
             .audio_streaming,
             .audio_spectrum,
             => self.web_engine == .system,
+            .audio_input => self.web_engine == .system,
         };
     }
 
@@ -867,6 +896,16 @@ fn appkitCallback(context: ?*anyopaque, event: *const AppKitEvent) callconv(.c) 
             .buffering = event.audio_buffering != 0,
             .bands = event.audio_bands,
         } }),
+        .audio_input => state.emit(.{ .audio_input = .{
+            .session_id = event.audio_input_session_id,
+            .kind = audioInputEventKindFromInt(event.audio_input_kind),
+            .format = .{
+                .sample_rate_hz = event.audio_input_sample_rate_hz,
+                .channels = event.audio_input_channels,
+            },
+            .device_generation = event.audio_input_device_generation,
+            .dropped_frames = event.audio_input_dropped_frames,
+        } }),
         .widget_accessibility_action => if (widgetAccessibilityActionFromInt(event.widget_action)) |action| {
             state.emit(.{ .widget_accessibility_action = .{
                 .window_id = event.window_id,
@@ -906,6 +945,23 @@ fn audioEventKindFromInt(value: c_int) platform_mod.AudioEventKind {
         1 => .position,
         2 => .completed,
         4 => .spectrum,
+        else => .failed,
+    };
+}
+
+/// Ordinals match `native_sdk_appkit_audio_input_event_kind_t` in the C
+/// host. An unknown report must fail loudly rather than accidentally look
+/// like a healthy capture transition.
+fn audioInputEventKindFromInt(value: c_int) platform_mod.AudioInputEventKind {
+    return switch (value) {
+        0 => .started,
+        1 => .source_changed,
+        2 => .format_changed,
+        3 => .devices_changed,
+        4 => .device_lost,
+        5 => .interrupted,
+        6 => .stopped,
+        7 => .permission_denied,
         else => .failed,
     };
 }
@@ -1365,6 +1421,58 @@ fn audioSetVolume(context: ?*anyopaque, volume: f32) anyerror!void {
     _ = native_sdk_appkit_audio_set_volume(self.host, volume);
 }
 
+/// Enumerate Core Audio input devices without opening a device or requesting
+/// consent. The C host copies opaque UIDs into fixed-size ABI records; this
+/// layer converts them into the public plain-data snapshot.
+fn audioInputListDevices(context: ?*anyopaque, devices: []platform_mod.AudioInputDevice) anyerror!platform_mod.AudioInputDeviceList {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    if (self.web_engine != .system) return error.UnsupportedService;
+    var host_devices: [platform_mod.max_audio_input_devices]AppKitAudioInputDevice = undefined;
+    var generation: u64 = 0;
+    const count = native_sdk_appkit_audio_input_list_devices(self.host, &host_devices, @min(devices.len, host_devices.len), &generation);
+    if (count > devices.len or count > host_devices.len) return error.InvalidAudioOptions;
+    for (host_devices[0..count], 0..) |host_device, index| {
+        if (host_device.id_len == 0 or host_device.id_len > host_device.id_storage.len or host_device.label_len > host_device.label_storage.len) return error.InvalidAudioOptions;
+        try devices[index].set(host_device.id_storage[0..host_device.id_len], host_device.label_storage[0..host_device.label_len], host_device.is_default != 0);
+    }
+    return .{ .generation = generation, .count = count };
+}
+
+/// Starts a low-level input stream. The public sink stays on `MacPlatform`
+/// and is invoked only by `appkitAudioInputCallback` on the host's audio
+/// callback path; lifecycle reports arrive later through the normal loop.
+fn audioInputStart(context: ?*anyopaque, options: platform_mod.AudioInputOptions, sink: platform_mod.AudioInputSink) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    if (self.web_engine != .system) return error.UnsupportedService;
+    self.audio_input_sink = sink;
+    if (native_sdk_appkit_audio_input_start(self.host, options.session_id, options.device_id.ptr, options.device_id.len, options.sample_rate_hz, options.channels, appkitAudioInputCallback, self) != 0) {
+        self.audio_input_sink = null;
+        return error.InvalidAudioOptions;
+    }
+}
+
+fn audioInputStop(context: ?*anyopaque) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    native_sdk_appkit_audio_input_stop(self.host);
+    self.audio_input_sink = null;
+}
+
+/// Called on Core Audio's input-render thread. It does exactly one thing:
+/// hand the borrowed frame to the application sink. It does not allocate,
+/// queue a platform event, or enter the UI loop.
+fn appkitAudioInputCallback(context: ?*anyopaque, samples: [*]const f32, sample_count: usize, sequence: u64, timestamp_ns: u64, sample_rate_hz: u32, channels: u8, discontinuity: c_int, dropped_frames: u64) callconv(.c) void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    const sink = self.audio_input_sink orelse return;
+    sink.onFrame(.{
+        .sequence = sequence,
+        .timestamp_ns = timestamp_ns,
+        .format = .{ .sample_rate_hz = sample_rate_hz, .channels = channels },
+        .samples = samples[0..sample_count],
+        .discontinuity = discontinuity != 0,
+        .dropped_frames = dropped_frames,
+    });
+}
+
 /// Thread-safe: dispatches onto the main queue, which emits `.wake` on
 /// the AppKit run loop. One of the two services worker threads may call.
 fn wake(context: ?*anyopaque) anyerror!void {
@@ -1790,6 +1898,7 @@ fn configureSecurityPolicy(context: ?*anyopaque, policy: security.Policy) anyerr
         external_urls.ptr,
         external_urls.len,
         @intFromEnum(policy.navigation.external_links.action),
+        if (security.hasPermission(policy.permissions, security.permission_microphone)) 1 else 0,
     );
 }
 

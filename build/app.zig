@@ -918,6 +918,11 @@ fn linkPlatform(b: *std.Build, dep: *std.Build.Dependency, target: std.Build.Res
         app_mod.linkFramework("AppKit", .{});
         // The audio playback service (the AppKit host's single AVPlayer).
         app_mod.linkFramework("AVFoundation", .{});
+        // Input capture uses Core Audio device enumeration/listeners and an
+        // AVAudioEngine input-node AudioUnit. Keep these explicit rather than
+        // relying on AVFoundation's transitive link behavior.
+        app_mod.linkFramework("AudioToolbox", .{});
+        app_mod.linkFramework("CoreAudio", .{});
         // Spectrum analysis of the app's own playback: the MediaToolbox
         // audio tap hands the player's PCM to the host, and Accelerate
         // (vDSP) turns it into band magnitudes.

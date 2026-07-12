@@ -29,6 +29,7 @@ native build   # produce a ReleaseFast binary in zig-out/bin/
 | `canvas-preview` | Canvas + WebView in one window, panes snapped to canvas anchors, a status item. |
 | `effects-probe` | The effect system live: spawn/fetch/file effects, cancellation, worker wakes. |
 | `menu-bar` | The menu-bar app lifecycle: `close_policy = "hide"`, a status item whose Open/Quit rows drive `fx.showWindow`/`fx.quitApp`, Dock reopen. |
+| `voice-notes` | Real-time microphone input: devices, PCM sink, lifecycle events, and a bounded WAV note. |
 
 ## Examples that own their build
 

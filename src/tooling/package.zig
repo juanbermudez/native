@@ -672,6 +672,8 @@ fn macosInfoPlist(allocator: std.mem.Allocator, metadata: manifest_tool.Metadata
     // dev runs pass to the panel directly.
     const about_line = try macosAboutLine(allocator, metadata);
     defer allocator.free(about_line);
+    const microphone_usage_description = try macosMicrophoneUsageDescription(allocator, metadata);
+    defer allocator.free(microphone_usage_description);
     // CFBundleName is the SHORT user-visible name — the application
     // menu's title next to the Apple menu reads it — while
     // CFBundleDisplayName serves the Finder and longer surfaces. Both
@@ -702,11 +704,11 @@ fn macosInfoPlist(allocator: std.mem.Allocator, metadata: manifest_tool.Metadata
         \\  <string>{s}</string>
         \\  <key>CFBundleVersion</key>
         \\  <string>{s}</string>
-        \\{s}{s}{s}
+        \\{s}{s}{s}{s}
         \\</dict>
         \\</plist>
         \\
-    , .{ bundle_id, display_name, display_name, executable, icon, version, version, about_line, document_types, url_types });
+    , .{ bundle_id, display_name, display_name, executable, icon, version, version, about_line, microphone_usage_description, document_types, url_types });
 }
 
 /// The optional NSHumanReadableCopyright entry (with trailing newline)
@@ -716,6 +718,24 @@ fn macosAboutLine(allocator: std.mem.Allocator, metadata: manifest_tool.Metadata
     const escaped = try xmlEscapeAlloc(allocator, description);
     defer allocator.free(escaped);
     return std.fmt.allocPrint(allocator, "  <key>NSHumanReadableCopyright</key>\n  <string>{s}</string>\n", .{escaped});
+}
+
+/// The macOS privacy prompt must say why this named app needs microphone
+/// access. Omit the key entirely when the manifest does not declare the
+/// microphone permission: an unused privacy declaration would be misleading
+/// to both the system and the person installing the app.
+fn macosMicrophoneUsageDescription(allocator: std.mem.Allocator, metadata: manifest_tool.Metadata) ![]const u8 {
+    for (metadata.permissions) |permission| {
+        if (!std.mem.eql(u8, permission, "microphone")) continue;
+        const display_name = try xmlEscapeAlloc(allocator, metadata.displayName());
+        defer allocator.free(display_name);
+        return std.fmt.allocPrint(
+            allocator,
+            "  <key>NSMicrophoneUsageDescription</key>\n  <string>{s} needs microphone access to capture audio.</string>\n",
+            .{display_name},
+        );
+    }
+    return allocator.dupe(u8, "");
 }
 
 fn artifactSuffix(target: PackageTarget) []const u8 {
@@ -2295,6 +2315,31 @@ test "plist template includes identity executable and version" {
     const bare_plist = try macosInfoPlist(std.testing.allocator, bare, "demo");
     defer std.testing.allocator.free(bare_plist);
     try std.testing.expect(std.mem.indexOf(u8, bare_plist, "NSHumanReadableCopyright") == null);
+}
+
+test "macos plist declares microphone usage only for the microphone permission" {
+    const microphone_permissions = [_][]const u8{"microphone"};
+    const microphone: manifest_tool.Metadata = .{
+        .id = "dev.example.voice-notes",
+        .name = "voice-notes",
+        .display_name = "Voice Notes",
+        .version = "1.2.3",
+        .permissions = &microphone_permissions,
+    };
+    const microphone_plist = try macosInfoPlist(std.testing.allocator, microphone, "voice-notes");
+    defer std.testing.allocator.free(microphone_plist);
+    try std.testing.expect(std.mem.indexOf(u8, microphone_plist, "<key>NSMicrophoneUsageDescription</key>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, microphone_plist, "<string>Voice Notes needs microphone access to capture audio.</string>") != null);
+
+    const no_microphone: manifest_tool.Metadata = .{
+        .id = "dev.example.notes",
+        .name = "notes",
+        .display_name = "Notes",
+        .version = "1.2.3",
+    };
+    const no_microphone_plist = try macosInfoPlist(std.testing.allocator, no_microphone, "notes");
+    defer std.testing.allocator.free(no_microphone_plist);
+    try std.testing.expect(std.mem.indexOf(u8, no_microphone_plist, "NSMicrophoneUsageDescription") == null);
 }
 
 test "plist template includes document and URL registrations" {

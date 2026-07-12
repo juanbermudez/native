@@ -7,6 +7,7 @@ pub const permission_dialog = "dialog";
 pub const permission_filesystem = "filesystem";
 pub const permission_clipboard = "clipboard";
 pub const permission_network = "network";
+pub const permission_microphone = "microphone";
 pub const permission_notifications = "notifications";
 pub const permission_credentials = "credentials";
 

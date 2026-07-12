@@ -605,6 +605,21 @@ pub const EffectAudio = struct {
     bands: [platform.audio_spectrum_band_count]u8 = @splat(0),
 };
 
+/// Compact control-plane report for one real-time audio-input session. PCM
+/// never enters an effect Msg: the application-owned `AudioInputSink` receives
+/// frames directly on the platform's audio callback path.
+pub const EffectAudioInput = struct {
+    /// App-chosen channel key, stable for this `startAudioInput` request.
+    key: u64,
+    /// Platform-assigned-by-effects identity. A host echoes it on every
+    /// lifecycle event so a late report from a replaced session is ignored.
+    session_id: u64,
+    kind: platform.AudioInputEventKind,
+    format: platform.AudioInputFormat = .{},
+    device_generation: u64 = 0,
+    dropped_frames: u64 = 0,
+};
+
 /// Where the active playback's bytes actually come from — the resolved
 /// end of the `playAudio` source cascade (local file, then verified
 /// cache entry, then network stream). Exposed in the snapshot and the
@@ -1142,6 +1157,7 @@ pub fn Effects(comptime Msg: type) type {
         pub const AudioMsgFn = *const fn (event: EffectAudio) Msg;
         pub const HostMsgFn = *const fn (result: EffectHostResult) Msg;
         pub const ImageMsgFn = *const fn (result: EffectImageResult) Msg;
+        pub const AudioInputMsgFn = *const fn (event: EffectAudioInput) Msg;
 
         /// Comptime Msg constructor for `on_line`, following
         /// `canvas.Ui(Msg).inputMsg`: `lineMsg(.agent_line)` builds
@@ -1246,6 +1262,16 @@ pub fn Effects(comptime Msg: type) type {
             return struct {
                 fn make(result: EffectImageResult) Msg {
                     return @unionInit(Msg, @tagName(tag), result);
+                }
+            }.make;
+        }
+
+        /// Comptime Msg constructor for compact audio-input lifecycle
+        /// reports. The variant's payload type must be `EffectAudioInput`.
+        pub fn audioInputMsg(comptime tag: std.meta.Tag(Msg)) AudioInputMsgFn {
+            return struct {
+                fn make(event: EffectAudioInput) Msg {
+                    return @unionInit(Msg, @tagName(tag), event);
                 }
             }.make;
         }
@@ -1550,6 +1576,17 @@ pub fn Effects(comptime Msg: type) type {
             expected_bytes: u64,
         };
 
+        /// Start a real-time microphone session. `sink` is the data plane:
+        /// it is invoked directly by the host and MUST NOT re-enter the UI or
+        /// effects loop. `on_event` receives lifecycle/device notifications
+        /// only, never PCM.
+        pub const StartAudioInputOptions = struct {
+            key: u64,
+            options: platform.AudioInputOptions = .{},
+            sink: platform.AudioInputSink,
+            on_event: ?AudioInputMsgFn = null,
+        };
+
         /// A recorded fx timer, exposed by the fake executor for test
         /// assertions.
         pub const TimerRequest = struct {
@@ -1619,6 +1656,32 @@ pub fn Effects(comptime Msg: type) type {
             }
         };
 
+        /// One active input session is the current platform contract. The
+        /// session id makes replacement safe: old platform events cannot be
+        /// attributed to the newly started channel.
+        const AudioInputChannel = struct {
+            active: bool = false,
+            fake: bool = false,
+            key: u64 = 0,
+            session_id: u64 = 0,
+            on_event: ?AudioInputMsgFn = null,
+            sink: ?platform.AudioInputSink = null,
+            format: platform.AudioInputFormat = .{},
+            device_generation: u64 = 0,
+            dropped_frames: u64 = 0,
+            device_id_buffer: [platform.max_audio_input_device_id_bytes]u8 = undefined,
+            device_id_len: usize = 0,
+
+            fn options(channel: *const AudioInputChannel) platform.AudioInputOptions {
+                return .{
+                    .session_id = channel.session_id,
+                    .device_id = channel.device_id_buffer[0..channel.device_id_len],
+                    .sample_rate_hz = channel.format.sample_rate_hz,
+                    .channels = channel.format.channels,
+                };
+            }
+        };
+
         /// Playback state the automation snapshot exposes: honest — it
         /// reports what the platform has told us, not what the UI wishes.
         pub const AudioSnapshot = struct {
@@ -1634,6 +1697,25 @@ pub fn Effects(comptime Msg: type) type {
             /// "this host does not analyze" is visible right here.
             spectrum_bands: [platform.audio_spectrum_band_count]u8 = @splat(0),
             spectrum_events: u64 = 0,
+        };
+
+        /// Small, automation-safe mirror of audio-input state. It contains
+        /// no samples or frame buffers.
+        pub const AudioInputSnapshot = struct {
+            active: bool = false,
+            key: u64 = 0,
+            session_id: u64 = 0,
+            format: platform.AudioInputFormat = .{},
+            device_generation: u64 = 0,
+            dropped_frames: u64 = 0,
+        };
+
+        /// Fake-executor request mirror. The sink itself stays private so a
+        /// test cannot accidentally turn its audio callback into a message.
+        pub const AudioInputRequest = struct {
+            key: u64,
+            session_id: u64,
+            options: platform.AudioInputOptions,
         };
 
         /// A recorded audio playback request, exposed by the fake
@@ -1765,6 +1847,9 @@ pub fn Effects(comptime Msg: type) type {
             /// there for why they must be non-lossy) and take this
             /// union shape only at drain time, in `takePendingMsg`.
             image: struct { result: EffectImageResult, image_fn: ?ImageMsgFn, regenerates: bool },
+            /// Audio-input lifecycle reports only. The PCM callback is a
+            /// separate platform data plane and never reaches this union.
+            audio_input: struct { key: u64, event: platform.AudioInputEvent, input_fn: ?AudioInputMsgFn, resolve: bool },
 
             fn addDropped(pending: *PendingMsg, count: u32) void {
                 switch (pending.*) {
@@ -1788,6 +1873,7 @@ pub fn Effects(comptime Msg: type) type {
                     // eviction here would silently break the
                     // exactly-one-terminal-per-load contract.
                     .image => unreachable,
+                    .audio_input => {},
                 }
             }
 
@@ -1802,6 +1888,7 @@ pub fn Effects(comptime Msg: type) type {
                     .host => 0,
                     // Never in the ring; see `addDropped`.
                     .image => unreachable,
+                    .audio_input => 0,
                 };
             }
         };
@@ -2257,6 +2344,10 @@ pub fn Effects(comptime Msg: type) type {
         /// The single audio playback channel (see `AudioChannel`).
         /// Loop-thread only, like the timer table.
         audio: AudioChannel = .{},
+        /// The single real-time audio-input channel. Its PCM sink is never
+        /// represented by this queue; only compact lifecycle events are.
+        audio_input: AudioInputChannel = .{},
+        next_audio_input_session_id: u64 = 1,
         queue_mutex: SpinMutex = .{},
         queue: [max_effect_queue_entries]Entry = undefined,
         queue_head: usize = 0,
@@ -2371,6 +2462,10 @@ pub fn Effects(comptime Msg: type) type {
                     slot.generation = 0;
                 }
             }
+            if (self.audio_input.active and !self.audio_input.fake) {
+                if (self.services) |services| services.audioInputStop() catch {};
+            }
+            self.audio_input = .{};
             for (&self.slots) |*slot| {
                 if (slot.state.load(.acquire) == .running and !slot.fake) {
                     slot.cancel_requested.store(true, .release);
@@ -3868,6 +3963,98 @@ pub fn Effects(comptime Msg: type) type {
             services.audioStop() catch {};
         }
 
+        /// Fill caller-owned device storage. Device enumeration never opens a
+        /// microphone and never prompts; the platform owns that policy.
+        pub fn listAudioInputDevices(self: *Self, devices: []platform.AudioInputDevice) anyerror!platform.AudioInputDeviceList {
+            const services = self.services orelse return error.UnsupportedService;
+            return services.audioInputListDevices(devices);
+        }
+
+        /// Start a keyed real-time input session. A replacement stops the
+        /// prior host session first; session ids prevent a delayed old event
+        /// from being delivered to the replacement. PCM goes straight to
+        /// `options.sink`, never through `takeMsg` or the journal.
+        pub fn startAudioInput(self: *Self, options: StartAudioInputOptions) void {
+            const invalid = options.options.device_id.len > platform.max_audio_input_device_id_bytes or
+                options.options.channels == 0 or options.options.channels > 2;
+            if (invalid) {
+                self.deliverLoopAudioInput(options.key, .{
+                    .session_id = options.options.session_id,
+                    .kind = .failed,
+                }, options.on_event);
+                return;
+            }
+            self.stopAudioInput();
+            const session_id = self.allocateAudioInputSessionId();
+            self.audio_input = .{
+                .active = true,
+                .fake = self.executor == .fake,
+                .key = options.key,
+                .session_id = session_id,
+                .on_event = options.on_event,
+                .sink = options.sink,
+                .format = .{
+                    .sample_rate_hz = options.options.sample_rate_hz,
+                    .channels = options.options.channels,
+                },
+            };
+            @memcpy(self.audio_input.device_id_buffer[0..options.options.device_id.len], options.options.device_id);
+            self.audio_input.device_id_len = options.options.device_id.len;
+            if (self.audio_input.fake) return;
+            const services = self.services orelse return self.failAudioInputChannel();
+            services.audioInputStart(self.audio_input.options(), options.sink) catch return self.failAudioInputChannel();
+        }
+
+        /// Stop and release the active input session. A host's late stopped
+        /// event is harmless because its session id no longer matches.
+        pub fn stopAudioInput(self: *Self) void {
+            if (!self.audio_input.active) return;
+            const fake = self.audio_input.fake;
+            self.audio_input = .{};
+            if (fake) return;
+            const services = self.services orelse return;
+            services.audioInputStop() catch {};
+        }
+
+        /// Route one compact platform lifecycle event to its typed app Msg.
+        /// Session mismatch deliberately swallows a stale report; raw PCM has
+        /// no route here at all.
+        pub fn takeAudioInputMsg(self: *Self, platform_event: platform.AudioInputEvent) ?Msg {
+            if (self.replay) return null;
+            const input_fn = self.audio_input.on_event;
+            const event = self.applyAudioInputEvent(platform_event) orelse return null;
+            const event_fn = input_fn orelse return null;
+            return event_fn(event);
+        }
+
+        pub fn audioInputSnapshot(self: *const Self) AudioInputSnapshot {
+            return .{
+                .active = self.audio_input.active,
+                .key = self.audio_input.key,
+                .session_id = self.audio_input.session_id,
+                .format = self.audio_input.format,
+                .device_generation = self.audio_input.device_generation,
+                .dropped_frames = self.audio_input.dropped_frames,
+            };
+        }
+
+        pub fn pendingAudioInput(self: *const Self) ?AudioInputRequest {
+            if (!self.audio_input.active) return null;
+            return .{
+                .key = self.audio_input.key,
+                .session_id = self.audio_input.session_id,
+                .options = self.audio_input.options(),
+            };
+        }
+
+        /// Fake executor helper for lifecycle-only testing. Frame data uses
+        /// the caller's sink directly and intentionally has no equivalent
+        /// here.
+        pub fn feedAudioInputEvent(self: *Self, event: platform.AudioInputEvent) !void {
+            if (!self.audio_input.active) return error.EffectNotFound;
+            self.deliverPending(.{ .audio_input = .{ .key = 0, .event = event, .input_fn = null, .resolve = true } });
+        }
+
         /// Jump the current playback to `position_ms` (the platform
         /// clamps to the duration). Idle channels no-op; no event echoes
         /// — the next position tick reports from the new position.
@@ -4290,6 +4477,25 @@ pub fn Effects(comptime Msg: type) type {
                             });
                             const image_fn = entry.image_fn orelse continue;
                             return image_fn(entry.result);
+                        },
+                        .audio_input => |entry| {
+                            var event: EffectAudioInput = undefined;
+                            var input_fn = entry.input_fn;
+                            if (entry.resolve) {
+                                input_fn = self.audio_input.on_event;
+                                event = self.applyAudioInputEvent(entry.event) orelse continue;
+                            } else {
+                                event = .{
+                                    .key = entry.key,
+                                    .session_id = entry.event.session_id,
+                                    .kind = entry.event.kind,
+                                    .format = entry.event.format,
+                                    .device_generation = entry.event.device_generation,
+                                    .dropped_frames = entry.event.dropped_frames,
+                                };
+                            }
+                            const event_fn = input_fn orelse continue;
+                            return event_fn(event);
                         },
                     }
                 }
@@ -5542,6 +5748,47 @@ pub fn Effects(comptime Msg: type) type {
         fn deliverLoopAudio(self: *Self, event: EffectAudio, audio_fn: ?AudioMsgFn) void {
             if (audio_fn == null) return;
             self.deliverPending(.{ .audio = .{ .event = event, .audio_fn = audio_fn, .resolve = false } });
+        }
+
+        fn applyAudioInputEvent(self: *Self, event: platform.AudioInputEvent) ?EffectAudioInput {
+            if (!self.audio_input.active or event.session_id != self.audio_input.session_id) return null;
+            const resolved: EffectAudioInput = .{
+                .key = self.audio_input.key,
+                .session_id = event.session_id,
+                .kind = event.kind,
+                .format = event.format,
+                .device_generation = event.device_generation,
+                .dropped_frames = event.dropped_frames,
+            };
+            if (event.format.sample_rate_hz > 0) self.audio_input.format = event.format;
+            if (event.device_generation > 0) self.audio_input.device_generation = event.device_generation;
+            self.audio_input.dropped_frames = event.dropped_frames;
+            switch (event.kind) {
+                .started, .source_changed, .format_changed, .devices_changed, .interrupted => {},
+                .device_lost, .stopped, .permission_denied, .failed => self.audio_input = .{},
+            }
+            return resolved;
+        }
+
+        fn failAudioInputChannel(self: *Self) void {
+            const channel = self.audio_input;
+            self.audio_input = .{};
+            self.deliverLoopAudioInput(channel.key, .{
+                .session_id = channel.session_id,
+                .kind = .failed,
+            }, channel.on_event);
+        }
+
+        fn deliverLoopAudioInput(self: *Self, key: u64, event: platform.AudioInputEvent, input_fn: ?AudioInputMsgFn) void {
+            if (input_fn == null) return;
+            self.deliverPending(.{ .audio_input = .{ .key = key, .event = event, .input_fn = input_fn, .resolve = false } });
+        }
+
+        fn allocateAudioInputSessionId(self: *Self) u64 {
+            const session_id = self.next_audio_input_session_id;
+            self.next_audio_input_session_id +%= 1;
+            if (self.next_audio_input_session_id == 0) self.next_audio_input_session_id = 1;
+            return session_id;
         }
 
         fn effectTimerPlatformId(slot_index: usize) u64 {

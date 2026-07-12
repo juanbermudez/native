@@ -162,6 +162,9 @@ pub const PlatformFeature = enum {
     /// the policy with a teaching error instead. The null platform
     /// models full support.
     window_hide_on_close,
+    /// Real-time microphone input. PCM uses a separate data-plane sink;
+    /// lifecycle and device-registry changes remain compact platform events.
+    audio_input,
 };
 
 pub const WebViewSourceKind = enum {
@@ -1392,6 +1395,102 @@ pub const AudioLoadResolution = enum(u8) {
     stream,
 };
 
+pub const max_audio_input_devices: usize = 32;
+pub const max_audio_input_device_id_bytes: usize = 128;
+pub const max_audio_input_device_label_bytes: usize = 128;
+
+/// Opaque device identity plus human-facing presentation data. Applications
+/// may remember an id, but must tolerate it being absent in a later snapshot.
+pub const AudioInputDevice = struct {
+    id_storage: [max_audio_input_device_id_bytes]u8 = @splat(0),
+    id_len: usize = 0,
+    label_storage: [max_audio_input_device_label_bytes]u8 = @splat(0),
+    label_len: usize = 0,
+    is_default: bool = false,
+
+    pub fn id(self: *const AudioInputDevice) []const u8 {
+        return self.id_storage[0..self.id_len];
+    }
+
+    pub fn label(self: *const AudioInputDevice) []const u8 {
+        return self.label_storage[0..self.label_len];
+    }
+
+    pub fn set(self: *AudioInputDevice, device_id: []const u8, device_label: []const u8, is_default: bool) !void {
+        if (device_id.len == 0 or device_id.len > self.id_storage.len or device_label.len > self.label_storage.len) return error.InvalidAudioOptions;
+        @memcpy(self.id_storage[0..device_id.len], device_id);
+        @memcpy(self.label_storage[0..device_label.len], device_label);
+        self.id_len = device_id.len;
+        self.label_len = device_label.len;
+        self.is_default = is_default;
+    }
+};
+
+pub const AudioInputDeviceList = struct {
+    generation: u64 = 0,
+    count: usize = 0,
+};
+
+pub const AudioInputFormat = struct {
+    sample_rate_hz: u32 = 0,
+    channels: u8 = 0,
+};
+
+/// An empty `device_id` follows the system default. An explicit id stays
+/// pinned and reports `.device_lost` instead of silently capturing another
+/// source.
+pub const AudioInputOptions = struct {
+    /// Assigned by the owning runtime/effect channel. Hosts echo it on every
+    /// control event so a late report from a replaced capture is never applied
+    /// to the new session.
+    session_id: u64 = 0,
+    device_id: []const u8 = "",
+    sample_rate_hz: u32 = 0,
+    channels: u8 = 1,
+};
+
+/// Borrowed interleaved f32 PCM. Samples die when the sink callback returns;
+/// applications must copy or enqueue immediately and must not block, allocate,
+/// or enter the UI loop from that callback.
+pub const AudioInputFrame = struct {
+    sequence: u64,
+    timestamp_ns: u64,
+    format: AudioInputFormat,
+    samples: []const f32,
+    discontinuity: bool = false,
+    dropped_frames: u64 = 0,
+};
+
+pub const AudioInputSink = struct {
+    context: ?*anyopaque = null,
+    on_frame_fn: *const fn (context: ?*anyopaque, frame: AudioInputFrame) void,
+
+    pub fn onFrame(self: AudioInputSink, frame: AudioInputFrame) void {
+        self.on_frame_fn(self.context, frame);
+    }
+};
+
+pub const AudioInputEventKind = enum(u8) {
+    started,
+    source_changed,
+    format_changed,
+    devices_changed,
+    device_lost,
+    interrupted,
+    stopped,
+    permission_denied,
+    failed,
+};
+
+/// Control-plane state only. PCM never enters the runtime event queue.
+pub const AudioInputEvent = struct {
+    session_id: u64 = 0,
+    kind: AudioInputEventKind,
+    format: AudioInputFormat = .{},
+    device_generation: u64 = 0,
+    dropped_frames: u64 = 0,
+};
+
 pub const FileDropEvent = struct {
     window_id: WindowId = 1,
     view_label: []const u8 = "",
@@ -2034,6 +2133,9 @@ pub const Event = union(enum) {
     /// Audio player reports: load acknowledgment, coarse position ticks
     /// while playing, one completion at natural end, async failures.
     audio: AudioEvent,
+    /// Audio-input lifecycle and device-registry notifications. Raw PCM uses
+    /// the separate `AudioInputSink` data plane.
+    audio_input: AudioInputEvent,
 
     pub fn name(self: Event) []const u8 {
         return switch (self) {
@@ -2061,6 +2163,7 @@ pub const Event = union(enum) {
             .context_menu_action => "context_menu_action",
             .widget_accessibility_action => "widget_accessibility_action",
             .audio => "audio",
+            .audio_input => "audio_input",
         };
     }
 };
@@ -2235,6 +2338,15 @@ pub const PlatformServices = struct {
     audio_seek_fn: ?*const fn (context: ?*anyopaque, position_ms: u64) anyerror!void = null,
     /// Set the player volume, `0.0` (silent) through `1.0` (full).
     audio_set_volume_fn: ?*const fn (context: ?*anyopaque, volume: f32) anyerror!void = null,
+    /// Fill caller-owned storage with a snapshot of selectable microphone
+    /// sources. Enumeration does not open an input device or prompt for
+    /// microphone permission.
+    audio_input_list_devices_fn: ?*const fn (context: ?*anyopaque, devices: []AudioInputDevice) anyerror!AudioInputDeviceList = null,
+    /// Start one input session. Raw PCM reaches `sink` directly; it never
+    /// passes through the UI or effect queues.
+    audio_input_start_fn: ?*const fn (context: ?*anyopaque, options: AudioInputOptions, sink: AudioInputSink) anyerror!void = null,
+    /// Stop and release the active input session.
+    audio_input_stop_fn: ?*const fn (context: ?*anyopaque) anyerror!void = null,
     /// Nudge the platform event loop from ANY thread: the platform must
     /// deliver a `.wake` event on its loop thread as soon as possible.
     /// One of exactly two `PlatformServices` entries that may be called
@@ -2748,6 +2860,27 @@ pub const PlatformServices = struct {
         return volume_fn(self.context, volume);
     }
 
+    pub fn audioInputListDevices(self: PlatformServices, devices: []AudioInputDevice) anyerror!AudioInputDeviceList {
+        if (devices.len > max_audio_input_devices) return error.InvalidAudioOptions;
+        const list_fn = self.audio_input_list_devices_fn orelse return error.UnsupportedService;
+        const list = try list_fn(self.context, devices);
+        if (list.count > devices.len) return error.InvalidAudioOptions;
+        return list;
+    }
+
+    pub fn audioInputStart(self: PlatformServices, options: AudioInputOptions, sink: AudioInputSink) anyerror!void {
+        if (options.device_id.len > max_audio_input_device_id_bytes or options.channels == 0 or options.channels > 2) {
+            return error.InvalidAudioOptions;
+        }
+        const start_fn = self.audio_input_start_fn orelse return error.UnsupportedService;
+        return start_fn(self.context, options, sink);
+    }
+
+    pub fn audioInputStop(self: PlatformServices) anyerror!void {
+        const stop_fn = self.audio_input_stop_fn orelse return error.UnsupportedService;
+        return stop_fn(self.context);
+    }
+
     /// Ask the platform loop to deliver a `.wake` event on its own thread.
     /// Safe to call from any thread; a missing implementation is an error
     /// so callers never assume a nudge happened when it did not.
@@ -2914,6 +3047,7 @@ fn defaultSupportsFeature(services: PlatformServices, feature: PlatformFeature) 
         // verb: hosts that implement it answer through their own
         // `supports_fn`. The generic floor is honest refusal.
         .window_hide_on_close => false,
+        .audio_input => services.audio_input_list_devices_fn != null and services.audio_input_start_fn != null,
     };
 }
 
