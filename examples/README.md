@@ -28,6 +28,7 @@ native build   # produce a ReleaseFast binary in zig-out/bin/
 | `gpu-components` | The retained GPU widget controls in one native-first component lab. |
 | `canvas-preview` | Canvas + WebView in one window, panes snapped to canvas anchors, a status item. |
 | `effects-probe` | The effect system live: spawn/fetch/file effects, cancellation, worker wakes. |
+| `voice-notes` | Real-time microphone input: devices, PCM sink, lifecycle events, and a bounded WAV note. |
 
 ## Examples that own their build
 

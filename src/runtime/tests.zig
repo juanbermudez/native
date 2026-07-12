@@ -20,6 +20,7 @@ test {
     _ = @import("effects_file_tests.zig");
     _ = @import("effects_clipboard_tests.zig");
     _ = @import("effects_audio_tests.zig");
+    _ = @import("effects_audio_input_tests.zig");
     _ = @import("clock.zig");
     _ = @import("frame_profile.zig");
     _ = @import("markdown_app_tests.zig");

@@ -1,0 +1,1 @@
+feature: **Audio input preview (macOS)**: Native apps can enumerate/select microphones and receive timestamped PCM through an app-owned sink, with device/lifecycle events and a `voice-notes` example; the `microphone` manifest permission now emits a display-name-specific `NSMicrophoneUsageDescription` in packaged apps.

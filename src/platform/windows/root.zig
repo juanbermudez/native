@@ -359,6 +359,7 @@ pub const WindowsPlatform = struct {
             // in Windows 10 2004 — the host probes the activation
             // support live instead of assuming the build.
             .audio_spectrum => self.web_engine == .system and audioSpectrumAvailable(self.host),
+            .audio_input => false,
             // Native scroll drivers, native context menus, and app-owned
             // view-surface adoption are macOS-only today; Win32 keeps
             // the engine's wheel physics (TrackPopupMenu is the natural

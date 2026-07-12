@@ -146,6 +146,15 @@ const EventHandler = types.EventHandler;
 const PlatformServices = types.PlatformServices;
 const Platform = types.Platform;
 const Backend = types.Backend;
+const AudioInputDevice = types.AudioInputDevice;
+const AudioInputDeviceList = types.AudioInputDeviceList;
+const AudioInputEvent = types.AudioInputEvent;
+const AudioInputEventKind = types.AudioInputEventKind;
+const AudioInputFormat = types.AudioInputFormat;
+const AudioInputFrame = types.AudioInputFrame;
+const AudioInputOptions = types.AudioInputOptions;
+const AudioInputSink = types.AudioInputSink;
+const max_audio_input_devices = types.max_audio_input_devices;
 
 pub const max_null_timers: usize = 16;
 /// Matches the runtime image registry's slot count
@@ -212,6 +221,21 @@ pub const NullAudio = struct {
     pub fn path(self: *const NullAudio) []const u8 {
         return self.path_storage[0..self.path_len];
     }
+};
+
+/// Deterministic input-capture state. The fake deliberately owns no sample
+/// buffer: `feedAudioInputFrame` calls the app-owned sink directly, which
+/// keeps tests honest about the production data-plane contract.
+pub const NullAudioInput = struct {
+    active: bool = false,
+    session_id: u64 = 0,
+    format: AudioInputFormat = .{},
+    follows_system_default: bool = true,
+    selected_device_index: ?usize = null,
+    sink: ?AudioInputSink = null,
+    next_sequence: u64 = 0,
+    dropped_frames: u64 = 0,
+    started_pending: bool = false,
 };
 
 pub const NullPlatform = struct {
@@ -485,6 +509,16 @@ pub const NullPlatform = struct {
     audio_stop_count: usize = 0,
     audio_seek_count: usize = 0,
     audio_volume_count: usize = 0,
+    /// The deterministic microphone host. Tests configure a device snapshot,
+    /// then use the normal `PlatformServices` API and feed known PCM through
+    /// `feedAudioInputFrame`; no hardware or permission prompt participates.
+    audio_input: bool = true,
+    audio_input_devices: [max_audio_input_devices]AudioInputDevice = undefined,
+    audio_input_device_count: usize = 0,
+    audio_input_device_generation: u64 = 1,
+    audio_input_start_count: usize = 0,
+    audio_input_stop_count: usize = 0,
+    audio_input_state: NullAudioInput = .{},
     /// Pending cross-thread wake requests. Incremented atomically because
     /// `wake_fn` is the one service worker threads call; tests and the
     /// embed host drain it on their own thread via `takeWake` and then
@@ -611,6 +645,9 @@ pub const NullPlatform = struct {
                 .audio_stop_fn = if (self.audio_playback) audioStop else null,
                 .audio_seek_fn = if (self.audio_playback) audioSeek else null,
                 .audio_set_volume_fn = if (self.audio_playback) audioSetVolume else null,
+                .audio_input_list_devices_fn = if (self.audio_input) audioInputListDevices else null,
+                .audio_input_start_fn = if (self.audio_input) audioInputStart else null,
+                .audio_input_stop_fn = if (self.audio_input) audioInputStop else null,
                 .wake_fn = wakeService,
                 .request_frame_fn = requestFrameService,
                 .request_gpu_surface_frame_fn = requestGpuSurfaceFrame,
@@ -658,6 +695,7 @@ pub const NullPlatform = struct {
             .audio_playback => self.audio_playback,
             .audio_streaming => self.audio_playback and self.audio_streaming,
             .audio_spectrum => self.audio_playback and self.audio_spectrum,
+            .audio_input => self.audio_input,
         };
     }
 
@@ -1333,6 +1371,130 @@ pub const NullPlatform = struct {
         const self: *NullPlatform = @ptrCast(@alignCast(context.?));
         self.audio_volume_count += 1;
         self.audio.volume = volume;
+    }
+
+    fn audioInputListDevices(context: ?*anyopaque, devices: []AudioInputDevice) anyerror!AudioInputDeviceList {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        if (devices.len < self.audio_input_device_count) return error.InvalidAudioOptions;
+        for (self.audio_input_devices[0..self.audio_input_device_count], 0..) |device, index| {
+            devices[index] = device;
+        }
+        return .{
+            .generation = self.audio_input_device_generation,
+            .count = self.audio_input_device_count,
+        };
+    }
+
+    fn audioInputStart(context: ?*anyopaque, options: AudioInputOptions, sink: AudioInputSink) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        const selected_index = self.findAudioInputDevice(options.device_id) orelse return error.InvalidAudioOptions;
+        self.audio_input_start_count += 1;
+        self.audio_input_state = .{
+            .active = true,
+            .session_id = options.session_id,
+            .format = .{
+                .sample_rate_hz = if (options.sample_rate_hz == 0) 48_000 else options.sample_rate_hz,
+                .channels = options.channels,
+            },
+            .follows_system_default = options.device_id.len == 0,
+            .selected_device_index = selected_index,
+            .sink = sink,
+            .started_pending = true,
+        };
+    }
+
+    fn audioInputStop(context: ?*anyopaque) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        self.audio_input_stop_count += 1;
+        self.audio_input_state = .{};
+    }
+
+    fn findAudioInputDevice(self: *const NullPlatform, requested_id: []const u8) ?usize {
+        if (requested_id.len > 0) {
+            for (self.audio_input_devices[0..self.audio_input_device_count], 0..) |device, index| {
+                if (std.mem.eql(u8, device.id(), requested_id)) return index;
+            }
+            return null;
+        }
+        for (self.audio_input_devices[0..self.audio_input_device_count], 0..) |device, index| {
+            if (device.is_default) return index;
+        }
+        return null;
+    }
+
+    /// Replace the fake input-device snapshot. An active default-following
+    /// session keeps following the new default; an explicit session remains
+    /// pinned and callers can report a `.device_lost` event if it disappears.
+    pub fn setAudioInputDevices(self: *NullPlatform, devices: []const AudioInputDevice) !void {
+        if (devices.len > self.audio_input_devices.len) return error.InvalidAudioOptions;
+        var default_count: usize = 0;
+        for (devices, 0..) |device, index| {
+            if (device.id_len == 0 or device.id_len > device.id_storage.len or device.label_len > device.label_storage.len) return error.InvalidAudioOptions;
+            if (device.is_default) default_count += 1;
+            self.audio_input_devices[index] = device;
+        }
+        if (default_count > 1) return error.InvalidAudioOptions;
+        self.audio_input_device_count = devices.len;
+        self.audio_input_device_generation +%= 1;
+        if (self.audio_input_device_generation == 0) self.audio_input_device_generation = 1;
+    }
+
+    /// Convenience setup helper for small tests and examples.
+    pub fn addAudioInputDevice(self: *NullPlatform, id: []const u8, label: []const u8, is_default: bool) !void {
+        if (self.audio_input_device_count >= self.audio_input_devices.len) return error.InvalidAudioOptions;
+        if (is_default) {
+            for (self.audio_input_devices[0..self.audio_input_device_count]) |*device| device.is_default = false;
+        }
+        try self.audio_input_devices[self.audio_input_device_count].set(id, label, is_default);
+        self.audio_input_device_count += 1;
+        self.audio_input_device_generation +%= 1;
+        if (self.audio_input_device_generation == 0) self.audio_input_device_generation = 1;
+    }
+
+    /// Consume the asynchronous `.started` report a real host emits after it
+    /// accepts capture. Dispatch the returned event through the runtime.
+    pub fn takeAudioInputStarted(self: *NullPlatform) ?Event {
+        if (!self.audio_input_state.started_pending) return null;
+        self.audio_input_state.started_pending = false;
+        return .{ .audio_input = .{
+            .session_id = self.audio_input_state.session_id,
+            .kind = .started,
+            .format = self.audio_input_state.format,
+            .device_generation = self.audio_input_device_generation,
+            .dropped_frames = self.audio_input_state.dropped_frames,
+        } };
+    }
+
+    /// Feed borrowed interleaved PCM directly to the registered app sink.
+    /// It creates no platform event: samples must never be queued through
+    /// the UI/runtime control plane.
+    pub fn feedAudioInputFrame(self: *NullPlatform, timestamp_ns: u64, samples: []const f32, discontinuity: bool) !void {
+        const state = &self.audio_input_state;
+        if (!state.active) return error.InvalidAudioOptions;
+        const sink = state.sink orelse return error.InvalidAudioOptions;
+        if (samples.len == 0 or samples.len % state.format.channels != 0) return error.InvalidAudioOptions;
+        state.next_sequence +%= 1;
+        sink.onFrame(.{
+            .sequence = state.next_sequence,
+            .timestamp_ns = timestamp_ns,
+            .format = state.format,
+            .samples = samples,
+            .discontinuity = discontinuity,
+            .dropped_frames = state.dropped_frames,
+        });
+    }
+
+    /// Produce an explicit lifecycle report for tests that model device loss,
+    /// interruptions, or registry changes. PCM has no equivalent helper.
+    pub fn audioInputEvent(self: *const NullPlatform, kind: AudioInputEventKind) ?Event {
+        if (!self.audio_input_state.active) return null;
+        return .{ .audio_input = .{
+            .session_id = self.audio_input_state.session_id,
+            .kind = kind,
+            .format = self.audio_input_state.format,
+            .device_generation = self.audio_input_device_generation,
+            .dropped_frames = self.audio_input_state.dropped_frames,
+        } };
     }
 
     fn audioUrlHash(url: []const u8) u64 {

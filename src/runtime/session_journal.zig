@@ -324,6 +324,7 @@ const EventTag = enum(u8) {
     context_menu_action = 22,
     widget_accessibility_action = 23,
     audio = 24,
+    audio_input = 25,
 };
 
 fn writeModifiers(cursor: *WriteCursor, modifiers: platform.ShortcutModifiers) JournalError!void {
@@ -471,6 +472,16 @@ pub fn encodeEvent(event: platform.Event, buffer: []u8) JournalError![]const u8 
             try cursor.writeBool(audio.playing);
             try cursor.writeBool(audio.buffering);
             try cursor.writeBytes(&audio.bands);
+        },
+        // Control-plane only: microphone PCM is never session-journal data.
+        .audio_input => |input| {
+            try cursor.writeEnum(EventTag.audio_input);
+            try cursor.writeInt(u64, input.session_id);
+            try cursor.writeEnum(input.kind);
+            try cursor.writeInt(u32, input.format.sample_rate_hz);
+            try cursor.writeByte(input.format.channels);
+            try cursor.writeInt(u64, input.device_generation);
+            try cursor.writeInt(u64, input.dropped_frames);
         },
         .files_dropped => |drop| {
             try cursor.writeEnum(EventTag.files_dropped);
@@ -668,6 +679,16 @@ pub fn decodeEvent(bytes: []const u8, storage: *EventDecodeStorage) JournalError
             @memcpy(&decoded.bands, try cursor.readBytes(decoded.bands.len));
             break :blk .{ .audio = decoded };
         },
+        .audio_input => .{ .audio_input = .{
+            .session_id = try cursor.readInt(u64),
+            .kind = try cursor.readEnum(platform.AudioInputEventKind),
+            .format = .{
+                .sample_rate_hz = try cursor.readInt(u32),
+                .channels = try cursor.readByte(),
+            },
+            .device_generation = try cursor.readInt(u64),
+            .dropped_frames = try cursor.readInt(u64),
+        } },
         .files_dropped => blk: {
             const window_id = try cursor.readInt(u64);
             const view_label = try cursor.readStr();

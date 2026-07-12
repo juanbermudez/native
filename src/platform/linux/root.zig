@@ -354,6 +354,7 @@ pub const LinuxPlatform = struct {
             // a host whose plugin set lacks it answers false and the
             // deck's glass rests honestly instead of dancing on fakes.
             .audio_spectrum => self.web_engine == .system and audioSpectrumAvailable(self.host),
+            .audio_input => false,
             .tray => false,
             // Native scroll drivers, native context menus, and app-owned
             // view-surface adoption are macOS-only today; GTK keeps the

@@ -32,6 +32,7 @@ typedef enum {
     NATIVE_SDK_APPKIT_EVENT_GPU_SURFACE_SCROLL_DRIVER = 18,
     NATIVE_SDK_APPKIT_EVENT_CONTEXT_MENU_ACTION = 19,
     NATIVE_SDK_APPKIT_EVENT_AUDIO = 20,
+    NATIVE_SDK_APPKIT_EVENT_AUDIO_INPUT = 21,
 } native_sdk_appkit_event_kind_t;
 
 /* Audio player reports (EVENT_AUDIO payloads). LOADED acknowledges a
@@ -57,6 +58,34 @@ typedef enum {
  * with log-spaced center frequencies covering roughly 50 Hz..16 kHz.
  * Part of the event ABI — the Zig side binds the array by this count. */
 #define NATIVE_SDK_APPKIT_AUDIO_SPECTRUM_BANDS 32
+
+/* Real-time microphone-input control reports. PCM does not ride the app
+ * event callback: the registered audio-input callback receives borrowed
+ * float frames on the host's audio thread. The UI/runtime gets only these
+ * lifecycle and device-registry reports. Ordinals mirror Zig's
+ * `AudioInputEventKind`. */
+typedef enum {
+    NATIVE_SDK_APPKIT_AUDIO_INPUT_STARTED = 0,
+    NATIVE_SDK_APPKIT_AUDIO_INPUT_SOURCE_CHANGED = 1,
+    NATIVE_SDK_APPKIT_AUDIO_INPUT_FORMAT_CHANGED = 2,
+    NATIVE_SDK_APPKIT_AUDIO_INPUT_DEVICES_CHANGED = 3,
+    NATIVE_SDK_APPKIT_AUDIO_INPUT_DEVICE_LOST = 4,
+    NATIVE_SDK_APPKIT_AUDIO_INPUT_INTERRUPTED = 5,
+    NATIVE_SDK_APPKIT_AUDIO_INPUT_STOPPED = 6,
+    NATIVE_SDK_APPKIT_AUDIO_INPUT_PERMISSION_DENIED = 7,
+    NATIVE_SDK_APPKIT_AUDIO_INPUT_FAILED = 8,
+} native_sdk_appkit_audio_input_event_kind_t;
+
+#define NATIVE_SDK_APPKIT_AUDIO_INPUT_DEVICE_ID_BYTES 128
+#define NATIVE_SDK_APPKIT_AUDIO_INPUT_DEVICE_LABEL_BYTES 128
+
+typedef struct {
+    char id[NATIVE_SDK_APPKIT_AUDIO_INPUT_DEVICE_ID_BYTES];
+    size_t id_len;
+    char label[NATIVE_SDK_APPKIT_AUDIO_INPUT_DEVICE_LABEL_BYTES];
+    size_t label_len;
+    int is_default;
+} native_sdk_appkit_audio_input_device_t;
 
 typedef enum {
     NATIVE_SDK_APPKIT_COLOR_SCHEME_LIGHT = 0,
@@ -298,10 +327,20 @@ typedef struct {
      * the -60 dBFS analysis floor at 0 to full scale at 255). Zeros on
      * every other event kind. */
     uint8_t audio_bands[NATIVE_SDK_APPKIT_AUDIO_SPECTRUM_BANDS];
+    /* EVENT_AUDIO_INPUT control payload. PCM never appears in this
+     * struct; `audio_input_session_id` identifies the active capture so
+     * late reports from a replaced session are safely ignored in Zig. */
+    uint64_t audio_input_session_id;
+    int audio_input_kind;
+    uint32_t audio_input_sample_rate_hz;
+    uint8_t audio_input_channels;
+    uint64_t audio_input_device_generation;
+    uint64_t audio_input_dropped_frames;
 } native_sdk_appkit_event_t;
 
 typedef void (*native_sdk_appkit_event_callback_t)(void *context, const native_sdk_appkit_event_t *event);
 typedef void (*native_sdk_appkit_bridge_callback_t)(void *context, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *message, size_t message_len, const char *origin, size_t origin_len);
+typedef void (*native_sdk_appkit_audio_input_callback_t)(void *context, const float *samples, size_t sample_count, uint64_t sequence, uint64_t timestamp_ns, uint32_t sample_rate_hz, uint8_t channels, int discontinuity, uint64_t dropped_frames);
 
 // show_policy 0 = immediate (ordered front at create), 1 = deferred to
 // the first canvas present (present-before-show: the window is created
@@ -339,7 +378,7 @@ void native_sdk_appkit_bridge_respond(native_sdk_appkit_host_t *host, const char
 void native_sdk_appkit_bridge_respond_window(native_sdk_appkit_host_t *host, uint64_t window_id, const char *response, size_t response_len);
 void native_sdk_appkit_bridge_respond_webview(native_sdk_appkit_host_t *host, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *response, size_t response_len);
 void native_sdk_appkit_emit_window_event(native_sdk_appkit_host_t *host, uint64_t window_id, const char *name, size_t name_len, const char *detail_json, size_t detail_json_len);
-void native_sdk_appkit_set_security_policy(native_sdk_appkit_host_t *host, const char *allowed_origins, size_t allowed_origins_len, const char *external_urls, size_t external_urls_len, int external_action);
+void native_sdk_appkit_set_security_policy(native_sdk_appkit_host_t *host, const char *allowed_origins, size_t allowed_origins_len, const char *external_urls, size_t external_urls_len, int external_action, int microphone_allowed);
 void native_sdk_appkit_set_menus(native_sdk_appkit_host_t *host, const char *const *menu_titles, const size_t *menu_title_lens, size_t menu_count, const uint32_t *item_menu_indices, const char *const *item_labels, const size_t *item_label_lens, const char *const *item_commands, const size_t *item_command_lens, const char *const *item_keys, const size_t *item_key_lens, const uint32_t *item_modifiers, const int *item_separators, const int *item_enabled, const int *item_checked, size_t item_count);
 void native_sdk_appkit_set_shortcuts(native_sdk_appkit_host_t *host, const char *const *ids, const size_t *id_lens, const char *const *keys, const size_t *key_lens, const uint32_t *modifiers, size_t count);
 int native_sdk_appkit_create_window(native_sdk_appkit_host_t *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy);
@@ -448,6 +487,14 @@ int native_sdk_appkit_audio_pause(native_sdk_appkit_host_t *host);
 int native_sdk_appkit_audio_stop(native_sdk_appkit_host_t *host);
 int native_sdk_appkit_audio_seek(native_sdk_appkit_host_t *host, uint64_t position_ms);
 int native_sdk_appkit_audio_set_volume(native_sdk_appkit_host_t *host, double volume);
+/* Audio input is one low-level stream session. Device ids are Core Audio
+ * UIDs (opaque to callers); list does not prompt, start owns runtime
+ * consent, and the callback's samples are borrowed only for that call.
+ * Return 0 means the request is accepted asynchronously; nonzero means
+ * invalid/unsupported arguments before a session could be started. */
+size_t native_sdk_appkit_audio_input_list_devices(native_sdk_appkit_host_t *host, native_sdk_appkit_audio_input_device_t *devices, size_t capacity, uint64_t *generation);
+int native_sdk_appkit_audio_input_start(native_sdk_appkit_host_t *host, uint64_t session_id, const char *device_id, size_t device_id_len, uint32_t sample_rate_hz, uint8_t channels, native_sdk_appkit_audio_input_callback_t callback, void *context);
+void native_sdk_appkit_audio_input_stop(native_sdk_appkit_host_t *host);
 /* Thread-safe: nudges the main run loop to emit a WAKE event. May be
  * called from any thread (worker threads streaming effect results). */
 void native_sdk_appkit_wake(native_sdk_appkit_host_t *host);
