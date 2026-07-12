@@ -20,6 +20,10 @@ pub const window_width: f32 = 620;
 pub const window_height: f32 = 540;
 pub const capture_key: u64 = 1;
 pub const write_key: u64 = 2;
+/// A short-lived input session is the platform operation that asks macOS for
+/// microphone access. It has a separate key from recording so the UI can
+/// distinguish consent from an actual note capture.
+pub const permission_key: u64 = 3;
 pub const output_path = "voice-note.wav";
 
 /// The file effect caps one write at 1 MiB. Keep the complete note inside that
@@ -165,6 +169,11 @@ pub const CaptureStore = struct {
 
 pub const CapturePhase = enum { idle, requesting, capturing, writing };
 
+/// Native deliberately does not invent a second permission database. The
+/// first successful input start proves this app can capture; a refusal or
+/// platform failure keeps the recorder behind the consent screen.
+pub const PermissionState = enum { needs_request, requesting, granted, denied, unavailable };
+
 pub const DeviceRow = struct {
     index: usize,
     device: *const native_sdk.AudioInputDevice,
@@ -178,6 +187,7 @@ pub const Model = struct {
     device_count: usize = 0,
     selected_device: ?usize = null,
     device_generation: u64 = 0,
+    permission: PermissionState = .needs_request,
     phase: CapturePhase = .idle,
     format: native_sdk.AudioInputFormat = .{ .sample_rate_hz = 48_000, .channels = 1 },
     saved_notes: u32 = 0,
@@ -186,7 +196,7 @@ pub const Model = struct {
 
     pub fn init(capture: *CaptureStore) Model {
         var model: Model = .{ .capture = capture };
-        model.setStatus("Choose an input, then start a short voice note.", .{});
+        model.setStatus("Microphone access has not been requested yet.", .{});
         return model;
     }
 
@@ -240,6 +250,7 @@ pub const Model = struct {
 };
 
 pub const Msg = union(enum) {
+    request_permission,
     refresh_devices,
     select_system_default,
     select_device: usize,
@@ -252,12 +263,11 @@ pub const Msg = union(enum) {
 pub const VoiceNotesApp = native_sdk.UiApp(Model, Msg);
 pub const Effects = VoiceNotesApp.Effects;
 
-pub fn boot(model: *Model, fx: *Effects) void {
-    refreshDevices(model, fx);
-}
+pub fn boot(_: *Model, _: *Effects) void {}
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
+        .request_permission => requestPermission(model, fx),
         .refresh_devices => refreshDevices(model, fx),
         .select_system_default => {
             if (model.phase == .idle) model.selected_device = null;
@@ -296,7 +306,7 @@ fn refreshDevices(model: *Model, fx: *Effects) void {
 }
 
 fn startCapture(model: *Model, fx: *Effects) void {
-    if (model.phase != .idle) return;
+    if (model.permission != .granted or model.phase != .idle) return;
     model.capture.begin(.{ .sample_rate_hz = 48_000, .channels = 1 });
     model.format = .{ .sample_rate_hz = 48_000, .channels = 1 };
     model.phase = .requesting;
@@ -307,6 +317,26 @@ fn startCapture(model: *Model, fx: *Effects) void {
             .device_id = model.selectedDeviceId(),
             .sample_rate_hz = model.format.sample_rate_hz,
             .channels = model.format.channels,
+        },
+        .sink = model.capture.sink(),
+        .on_event = Effects.audioInputMsg(.input_event),
+    });
+}
+
+/// Request access by starting the same input service a recorder uses. The
+/// store remains inactive, so any direct PCM delivered while macOS accepts the
+/// request is discarded; `.started` immediately tears this probe back down.
+fn requestPermission(model: *Model, fx: *Effects) void {
+    if (model.permission == .requesting or model.permission == .granted) return;
+    model.capture.stop();
+    model.permission = .requesting;
+    model.phase = .idle;
+    model.setStatus("Requesting microphone access from macOS…", .{});
+    fx.startAudioInput(.{
+        .key = permission_key,
+        .options = .{
+            .sample_rate_hz = 48_000,
+            .channels = 1,
         },
         .sink = model.capture.sink(),
         .on_event = Effects.audioInputMsg(.input_event),
@@ -341,6 +371,11 @@ fn stopCapture(model: *Model, fx: *Effects) void {
 }
 
 fn handleInputEvent(model: *Model, event: native_sdk.EffectAudioInput, fx: *Effects) void {
+    if (event.key == permission_key) {
+        handlePermissionEvent(model, event, fx);
+        return;
+    }
+    if (event.key != capture_key) return;
     if (event.format.sample_rate_hz != 0) model.format = event.format;
     switch (event.kind) {
         .started => {
@@ -374,9 +409,72 @@ fn handleInputEvent(model: *Model, event: native_sdk.EffectAudioInput, fx: *Effe
     }
 }
 
+fn handlePermissionEvent(model: *Model, event: native_sdk.EffectAudioInput, fx: *Effects) void {
+    if (model.permission != .requesting) return;
+    switch (event.kind) {
+        .started => {
+            // The platform has now confirmed access. Do not retain an active
+            // microphone just to keep the consent screen open.
+            fx.stopAudioInput();
+            model.capture.stop();
+            model.permission = .granted;
+            refreshDevices(model, fx);
+            model.setStatus("Microphone enabled. Choose an input and record a short note.", .{});
+        },
+        .permission_denied => {
+            model.capture.stop();
+            model.permission = .denied;
+            model.setStatus("Microphone access is off. Enable it in macOS Settings, then try again.", .{});
+        },
+        .failed, .device_lost => {
+            model.capture.stop();
+            model.permission = .unavailable;
+            model.setStatus("No microphone could be started. Check an input device and try again.", .{});
+        },
+        .stopped => {
+            // A stop report can only follow a user/platform cancellation; the
+            // successful probe's stop is deliberately swallowed by Effects.
+            model.capture.stop();
+            model.permission = .needs_request;
+            model.setStatus("Microphone access was not confirmed. Try again when ready.", .{});
+        },
+        .devices_changed, .source_changed, .format_changed, .interrupted => {},
+    }
+}
+
 pub const VoiceNotesUi = canvas.Ui(Msg);
 
 pub fn view(ui: *VoiceNotesUi, model: *const Model) VoiceNotesUi.Node {
+    return switch (model.permission) {
+        .granted => recorderView(ui, model),
+        .needs_request, .requesting, .denied, .unavailable => permissionView(ui, model),
+    };
+}
+
+fn permissionView(ui: *VoiceNotesUi, model: *const Model) VoiceNotesUi.Node {
+    const state = model.permission;
+    return ui.column(.{ .grow = 1, .padding = 18, .main = .center, .cross = .center, .style_tokens = .{ .background = .background } }, .{
+        ui.panel(.{ .width = 420, .padding = 22, .style_tokens = .{ .background = .surface }, .semantics = .{ .label = "Microphone permission" } }, .{
+            ui.column(.{ .gap = 14 }, .{
+                ui.column(.{ .gap = 5 }, .{
+                    ui.text(.{ .size = .heading }, permissionTitle(state)),
+                    ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, "Voice Notes records locally from a microphone you choose."),
+                }),
+                ui.text(.{ .wrap = true }, permissionExplanation(state)),
+                ui.button(.{
+                    .variant = .primary,
+                    .on_press = .request_permission,
+                    .disabled = state == .requesting,
+                    .semantics = .{ .label = "Request microphone permission" },
+                }, permissionButtonLabel(state)),
+                ui.text(.{ .wrap = true, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "macOS owns permission removal. Turn microphone access off later in System Settings > Privacy & Security > Microphone."),
+                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, model.status()),
+            }),
+        }),
+    });
+}
+
+fn recorderView(ui: *VoiceNotesUi, model: *const Model) VoiceNotesUi.Node {
     const rows = model.deviceRows(ui.arena);
     return ui.column(.{ .gap = 14, .padding = 18, .style_tokens = .{ .background = .background } }, .{
         ui.column(.{ .gap = 4 }, .{
@@ -407,9 +505,45 @@ pub fn view(ui: *VoiceNotesUi, model: *const Model) VoiceNotesUi.Node {
                 ui.text(.{ .style_tokens = if (model.capture.isOverflowed()) .{ .foreground = .destructive } else .{ .foreground = .text_muted } }, if (model.capture.isOverflowed()) "Capture buffer full: stop to save the bounded note." else "A note is bounded to one asynchronous 1 MiB WAV write."),
             }),
         }),
+        ui.panel(.{ .padding = 12, .style_tokens = .{ .background = .surface } }, .{
+            ui.column(.{ .gap = 4 }, .{
+                ui.text(.{}, "Input session details"),
+                ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "System default follows macOS. Selecting a listed source pins that source for one capture."),
+                ui.text(.{ .wrap = true, .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "This contribution intentionally exposes microphone input only. Output-device routing and playback selection are separate platform primitives, so this sample does not present a non-functional output picker."),
+            }),
+        }),
         ui.spacer(1),
         ui.statusBar(.{}, ui.fmt("{s}  ·  {d} saved", .{ model.status(), model.saved_notes })),
     });
+}
+
+fn permissionTitle(state: PermissionState) []const u8 {
+    return switch (state) {
+        .needs_request => "Allow microphone access",
+        .requesting => "Waiting for macOS",
+        .denied => "Microphone access is off",
+        .unavailable => "Microphone input is unavailable",
+        .granted => unreachable,
+    };
+}
+
+fn permissionExplanation(state: PermissionState) []const u8 {
+    return switch (state) {
+        .needs_request => "Before you can record a voice note, Voice Notes needs permission to read microphone input. Select Allow microphone and macOS will show its system prompt.",
+        .requesting => "macOS is deciding whether this app can access a microphone. The recorder will appear after access is confirmed.",
+        .denied => "Microphone access was not granted. Enable Voice Notes in System Settings, then return here and select Try again.",
+        .unavailable => "Voice Notes could not start an input session. Connect or enable a microphone, then select Try again.",
+        .granted => unreachable,
+    };
+}
+
+fn permissionButtonLabel(state: PermissionState) []const u8 {
+    return switch (state) {
+        .needs_request => "Allow microphone",
+        .requesting => "Waiting for macOS…",
+        .denied, .unavailable => "Try again",
+        .granted => unreachable,
+    };
 }
 
 fn phaseLabel(phase: CapturePhase) []const u8 {
