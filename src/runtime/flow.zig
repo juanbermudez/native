@@ -399,6 +399,21 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
                 .audio => |audio_event| {
                     try dispatchEvent(self, app, .{ .audio = audio_event });
                 },
+                .webview_navigation => |navigation| {
+                    log(self, "webview.navigation", "WebView navigation lifecycle", &.{
+                        trace.uint("window_id", navigation.window_id),
+                        trace.string("label", navigation.label),
+                        trace.uint("navigation_id", navigation.navigation_id),
+                        trace.string("phase", @tagName(navigation.phase)),
+                        trace.string("url", navigation.url),
+                        trace.string("failure_class", if (navigation.failure_class) |value| @tagName(value) else ""),
+                    });
+                    emitWebViewNavigationEvent(self, navigation) catch |err| log(self, "webview.navigation.emit_failed", @errorName(err), &.{
+                        trace.uint("window_id", navigation.window_id),
+                        trace.string("label", navigation.label),
+                    });
+                    try dispatchEvent(self, app, .{ .webview_navigation = navigation });
+                },
                 .wake => {
                     try dispatchEvent(self, app, .effects_wake);
                 },
@@ -464,6 +479,7 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
                 .timer => {},
                 .effects_wake => {},
                 .audio => {},
+                .webview_navigation => {},
                 .files_dropped => {},
                 .gpu_surface_frame => {},
                 .gpu_surface_resized => {},
@@ -1111,6 +1127,34 @@ pub fn RuntimeFlow(comptime Runtime: type) type {
             }
             try writer.writeAll("]}");
             try emitWindowEvent(self, drop.window_id, "drop:files", writer.buffered());
+        }
+
+        fn emitWebViewNavigationEvent(self: *Runtime, navigation: platform.WebViewNavigationEvent) anyerror!void {
+            var buffer: [platform.max_window_event_detail_bytes]u8 = undefined;
+            var writer = std.Io.Writer.fixed(&buffer);
+            try writer.print("{{\"windowId\":{d},\"label\":", .{navigation.window_id});
+            try json.writeString(&writer, navigation.label);
+            try writer.print(",\"navigationId\":\"{d}\",\"phase\":", .{navigation.navigation_id});
+            try json.writeString(&writer, @tagName(navigation.phase));
+            try writer.writeAll(",\"url\":");
+            try json.writeString(&writer, navigation.url);
+            if (navigation.failure_class) |failure_class| {
+                try writer.writeAll(",\"failureClass\":");
+                try json.writeString(&writer, @tagName(failure_class));
+            }
+            try writer.writeByte('}');
+            try emitWindowEvent(self, navigation.window_id, "webview:navigation", writer.buffered());
+
+            if (navigation.phase == .started or navigation.phase == .redirected) {
+                var alias_buffer: [platform.max_window_event_detail_bytes]u8 = undefined;
+                var alias_writer = std.Io.Writer.fixed(&alias_buffer);
+                try alias_writer.print("{{\"windowId\":{d},\"label\":", .{navigation.window_id});
+                try json.writeString(&alias_writer, navigation.label);
+                try alias_writer.writeAll(",\"url\":");
+                try json.writeString(&alias_writer, navigation.url);
+                try alias_writer.writeByte('}');
+                try emitWindowEvent(self, navigation.window_id, "webview:navigate", alias_writer.buffered());
+            }
         }
 
         /// Trace logging never fails dispatch: a full or failing

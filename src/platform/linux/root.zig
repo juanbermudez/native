@@ -95,6 +95,7 @@ const GtkEvent = extern struct {
 
 const GtkCallback = *const fn (context: ?*anyopaque, event: *const GtkEvent) callconv(.c) void;
 const GtkBridgeCallback = *const fn (context: ?*anyopaque, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, message: [*]const u8, message_len: usize, origin: [*]const u8, origin_len: usize) callconv(.c) void;
+const GtkWebViewNavigationCallback = *const fn (context: ?*anyopaque, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, engine_id: u64, phase: c_int, url: [*]const u8, url_len: usize, failure_class: c_int) callconv(.c) void;
 
 const shortcut_modifier_primary: u32 = 1 << 0;
 const shortcut_modifier_command: u32 = 1 << 1;
@@ -112,6 +113,7 @@ extern fn native_sdk_gtk_decode_image(bytes: [*]const u8, bytes_len: usize, pixe
 extern fn native_sdk_gtk_load_webview(host: *GtkHost, source: [*]const u8, source_len: usize, source_kind: c_int, asset_root: [*]const u8, asset_root_len: usize, asset_entry: [*]const u8, asset_entry_len: usize, asset_origin: [*]const u8, asset_origin_len: usize, spa_fallback: c_int) void;
 extern fn native_sdk_gtk_load_window_webview(host: *GtkHost, window_id: u64, source: [*]const u8, source_len: usize, source_kind: c_int, asset_root: [*]const u8, asset_root_len: usize, asset_entry: [*]const u8, asset_entry_len: usize, asset_origin: [*]const u8, asset_origin_len: usize, spa_fallback: c_int) void;
 extern fn native_sdk_gtk_set_bridge_callback(host: *GtkHost, callback: GtkBridgeCallback, context: ?*anyopaque) void;
+extern fn native_sdk_gtk_set_webview_navigation_callback(host: *GtkHost, callback: GtkWebViewNavigationCallback, context: ?*anyopaque) void;
 extern fn native_sdk_gtk_bridge_respond(host: *GtkHost, response: [*]const u8, response_len: usize) void;
 extern fn native_sdk_gtk_bridge_respond_window(host: *GtkHost, window_id: u64, response: [*]const u8, response_len: usize) void;
 extern fn native_sdk_gtk_bridge_respond_webview(host: *GtkHost, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, response: [*]const u8, response_len: usize) void;
@@ -341,6 +343,7 @@ pub const LinuxPlatform = struct {
             .file_drops,
             .app_activation_events,
             .gpu_surfaces,
+            .webview_navigation_events,
             => self.web_engine == .system,
             .credentials => self.web_engine == .system and credentialsAvailable(self.host),
             // Audio rides GStreamer (playbin), runtime-loaded like
@@ -392,6 +395,7 @@ pub const LinuxPlatform = struct {
             .handler_context = handler_context,
         };
         native_sdk_gtk_set_bridge_callback(self.host, gtkBridgeCallback, &self.state);
+        native_sdk_gtk_set_webview_navigation_callback(self.host, gtkWebViewNavigationCallback, &self.state);
         native_sdk_gtk_run(self.host, gtkCallback, &self.state);
         if (self.state.failed) return error.CallbackFailed;
     }
@@ -411,6 +415,7 @@ const RunState = struct {
     handler: ?platform_mod.EventHandler = null,
     handler_context: ?*anyopaque = null,
     failed: bool = false,
+    webview_navigation: platform_mod.webview_navigation.Tracker = .{},
 
     fn emit(self: *RunState, event: platform_mod.Event) void {
         const handler = self.handler orelse return;
@@ -421,6 +426,41 @@ const RunState = struct {
         };
     }
 };
+
+fn emitTrackedWebViewNavigation(context: *anyopaque, event: platform_mod.WebViewNavigationEvent) !void {
+    const state: *RunState = @ptrCast(@alignCast(context));
+    state.emit(.{ .webview_navigation = event });
+}
+
+fn gtkWebViewNavigationCallback(context: ?*anyopaque, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, engine_id: u64, phase: c_int, url: [*]const u8, url_len: usize, failure_class: c_int) callconv(.c) void {
+    const state: *RunState = @ptrCast(@alignCast(context.?));
+    const raw_phase = std.enums.fromInt(platform_mod.webview_navigation.RawPhase, phase) orelse {
+        state.failed = true;
+        return;
+    };
+    const mapped_failure: ?platform_mod.WebViewNavigationFailureClass = switch (failure_class) {
+        -1 => null,
+        0 => .network,
+        1 => .tls,
+        2 => .unknown,
+        else => {
+            state.failed = true;
+            return;
+        },
+    };
+    state.webview_navigation.ingest(.{
+        .window_id = window_id,
+        .label = webview_label[0..webview_label_len],
+        .engine_id = engine_id,
+        .phase = raw_phase,
+        .url = url[0..url_len],
+        .failure_class = mapped_failure,
+    }, state, emitTrackedWebViewNavigation) catch |err| {
+        std.debug.print("platform callback failed: {s} (event webview_navigation)\n", .{@errorName(err)});
+        state.failed = true;
+        if (state.self) |linux| native_sdk_gtk_stop(linux.host);
+    };
+}
 
 fn gtkCallback(context: ?*anyopaque, event: *const GtkEvent) callconv(.c) void {
     const state: *RunState = @ptrCast(@alignCast(context.?));
@@ -440,12 +480,33 @@ fn gtkCallback(context: ?*anyopaque, event: *const GtkEvent) callconv(.c) void {
             state.emit(.{ .surface_resized = surface });
         },
         .window_frame => if (state.self) |linux| {
-            const event_label = event.label[0..event.label_len];
-            const event_title = event.title[0..event.title_len];
+            if (event.label_len > platform_mod.max_window_label_bytes or event.title_len > platform_mod.max_window_title_bytes) {
+                state.failed = true;
+                native_sdk_gtk_stop(linux.host);
+                return;
+            }
+            // The observed-close path retires tracked children before it
+            // delivers the window event. That cancellation callback may
+            // synchronously reenter window close and free the host strings,
+            // so own the event identity before crossing into application code.
+            var event_label_buffer: [platform_mod.max_window_label_bytes]u8 = undefined;
+            var event_title_buffer: [platform_mod.max_window_title_bytes]u8 = undefined;
+            @memcpy(event_label_buffer[0..event.label_len], event.label[0..event.label_len]);
+            @memcpy(event_title_buffer[0..event.title_len], event.title[0..event.title_len]);
+            const event_label = event_label_buffer[0..event.label_len];
+            const event_title = event_title_buffer[0..event.title_len];
             const window = if (event_label.len > 0)
                 platform_mod.WindowOptions{ .id = event.window_id, .label = event_label, .title = event_title }
             else
                 linux.windowById(event.window_id);
+            if (event.open == 0) {
+                state.webview_navigation.cancelAndRetireWindow(event.window_id, state, emitTrackedWebViewNavigation) catch |err| {
+                    std.debug.print("platform callback failed: {s} (event webview_navigation window teardown)\n", .{@errorName(err)});
+                    state.failed = true;
+                    native_sdk_gtk_stop(linux.host);
+                    return;
+                };
+            }
             state.emit(.{ .window_frame_changed = .{
                 .id = window.id,
                 .label = window.label,
@@ -724,6 +785,7 @@ fn focusWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!
 fn closeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
     const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
     if (native_sdk_gtk_close_window(self.host, window_id) == 0) return error.CloseFailed;
+    try self.state.webview_navigation.cancelAndRetireWindow(window_id, &self.state, emitTrackedWebViewNavigation);
 }
 
 fn minimizeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
@@ -976,6 +1038,7 @@ fn closeWebView(context: ?*anyopaque, window_id: platform_mod.WindowId, label: [
         return error.UnsupportedChildWebViews;
     }
     if (native_sdk_gtk_close_webview(self.host, window_id, label.ptr, label.len) == 0) return error.WebViewNotFound;
+    try self.state.webview_navigation.cancelAndRetire(window_id, label, &self.state, emitTrackedWebViewNavigation);
 }
 
 fn showOpenDialog(context: ?*anyopaque, options: platform_mod.OpenDialogOptions, buffer: []u8) anyerror!platform_mod.OpenDialogResult {
@@ -1449,6 +1512,7 @@ test "linux chromium reports unsupported desktop features" {
     try std.testing.expect(LinuxPlatform.supportsFeature(&system, .native_control_commands));
     try std.testing.expect(LinuxPlatform.supportsFeature(&system, .menus));
     try std.testing.expect(LinuxPlatform.supportsFeature(&system, .gpu_surfaces));
+    try std.testing.expect(LinuxPlatform.supportsFeature(&system, .webview_navigation_events));
 
     var chromium = testPlatformWithEngine(.chromium);
     try std.testing.expect(!LinuxPlatform.supportsFeature(&chromium, .gpu_surfaces));
@@ -1459,6 +1523,7 @@ test "linux chromium reports unsupported desktop features" {
     try std.testing.expect(!LinuxPlatform.supportsFeature(&chromium, .native_control_commands));
     try std.testing.expect(!LinuxPlatform.supportsFeature(&chromium, .menus));
     try std.testing.expect(!LinuxPlatform.supportsFeature(&chromium, .dialogs));
+    try std.testing.expect(!LinuxPlatform.supportsFeature(&chromium, .webview_navigation_events));
     // Audio (like credentials) is a runtime probe on the system engine —
     // the hermetic build answers false without touching the extern — and
     // categorically unsupported on the chromium engine.

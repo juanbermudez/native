@@ -44,6 +44,9 @@ pub const CommandSource = enum {
 pub const ShortcutEvent = platform.ShortcutEvent;
 pub const TimerEvent = platform.TimerEvent;
 pub const Appearance = platform.Appearance;
+pub const WebViewNavigationPhase = platform.WebViewNavigationPhase;
+pub const WebViewNavigationFailureClass = platform.WebViewNavigationFailureClass;
+pub const WebViewNavigationEvent = platform.WebViewNavigationEvent;
 pub const GpuFrame = platform.GpuFrame;
 pub const GpuSurfaceFrameEvent = platform.GpuSurfaceFrameEvent;
 pub const GpuSurfaceResizeEvent = platform.GpuSurfaceResizeEvent;
@@ -269,6 +272,7 @@ pub const Event = union(enum) {
     /// tick, completion, failure): the ui-app layer routes it back
     /// through `Effects.takeAudioMsg` into the app's `on_event` Msg.
     audio: platform.AudioEvent,
+    webview_navigation: WebViewNavigationEvent,
     files_dropped: platform.FileDropEvent,
     gpu_surface_frame: GpuSurfaceFrameEvent,
     gpu_surface_resized: GpuSurfaceResizeEvent,
@@ -296,6 +300,7 @@ pub const Event = union(enum) {
             .timer => "timer",
             .effects_wake => "effects_wake",
             .audio => "audio",
+            .webview_navigation => "webview_navigation",
             .files_dropped => "files_dropped",
             .gpu_surface_frame => "gpu_surface_frame",
             .gpu_surface_resized => "gpu_surface_resized",

@@ -85,8 +85,9 @@ jobs:
         with:
           version: 0.16.0
       - name: Install WebKitGTK dependencies
-        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev xvfb
       - run: zig build test-webview-system-link -Dplatform=linux
+      - run: xvfb-run -a zig build test-webview-smoke -Dplatform=linux
       # Declare-to-use, proven on real Linux executables WITH the
       # WebKitGTK dev package installed — the seam, not the environment:
       # the native-only ui-inbox binary must carry no libwebkitgtk
@@ -100,11 +101,15 @@ jobs:
   windows-webview:
     name: Windows WebView
     runs-on: windows-2022
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       # Builds the WebView example with the system engine, compiling the
       # full embedded-WebView host against the vendored WebView2 SDK
       # header (third_party/webview2). The host refuses to fall back to
@@ -112,6 +117,20 @@ jobs:
       # include path, or a conformance error in the embedded layer — is a
       # compile failure here, not a silent WebViewNotFound at runtime.
       - run: zig build test-webview-system-link -Dplatform=windows
+      # Drive the same executable lifecycle matrix as WKWebView and
+      # WebKitGTK against the real hosted WebView2 runtime. Cross-builds
+      # and PE import audits do not substitute for this step.
+      - run: zig build test-webview-smoke -Dplatform=windows
+      - name: Upload WebView2 lifecycle evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-webview-navigation-smoke
+          if-no-files-found: warn
+          path: |
+            examples/webview/.zig-cache/native-sdk-webview-navigation-smoke.log
+            examples/webview/.zig-cache/native-sdk-webview-navigation-fixture.log
+            examples/webview/.zig-cache/native-sdk-automation/
 
   cef-platform-tooling:
     name: CEF Platform Tooling

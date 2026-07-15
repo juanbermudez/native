@@ -647,6 +647,9 @@ pub const NullPlatform = struct {
             .file_drops,
             .app_activation_events,
             => true,
+            // The null backend models WebView operations, but it does not
+            // run an engine adapter or emit correlated navigation events.
+            .webview_navigation_events => false,
             .gpu_surfaces => self.gpu_surfaces,
             .gpu_surface_scroll_drivers => self.gpu_surface_scroll_drivers,
             .context_menus => self.context_menus,

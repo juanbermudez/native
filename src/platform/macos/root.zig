@@ -118,6 +118,7 @@ const AppKitEvent = extern struct {
 
 const AppKitCallback = *const fn (context: ?*anyopaque, event: *const AppKitEvent) callconv(.c) void;
 const AppKitBridgeCallback = *const fn (context: ?*anyopaque, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, message: [*]const u8, message_len: usize, origin: [*]const u8, origin_len: usize) callconv(.c) void;
+const AppKitWebViewNavigationCallback = *const fn (context: ?*anyopaque, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, engine_id: u64, phase: c_int, url: [*]const u8, url_len: usize, failure_class: c_int) callconv(.c) void;
 
 const shortcut_modifier_primary: u32 = 1 << 0;
 const shortcut_modifier_command: u32 = 1 << 1;
@@ -134,6 +135,7 @@ extern fn native_sdk_appkit_stop(host: *AppKitHost) void;
 extern fn native_sdk_appkit_load_webview(host: *AppKitHost, source: [*]const u8, source_len: usize, source_kind: c_int, asset_root: [*]const u8, asset_root_len: usize, asset_entry: [*]const u8, asset_entry_len: usize, asset_origin: [*]const u8, asset_origin_len: usize, spa_fallback: c_int) void;
 extern fn native_sdk_appkit_load_window_webview(host: *AppKitHost, window_id: u64, source: [*]const u8, source_len: usize, source_kind: c_int, asset_root: [*]const u8, asset_root_len: usize, asset_entry: [*]const u8, asset_entry_len: usize, asset_origin: [*]const u8, asset_origin_len: usize, spa_fallback: c_int) void;
 extern fn native_sdk_appkit_set_bridge_callback(host: *AppKitHost, callback: AppKitBridgeCallback, context: ?*anyopaque) void;
+extern fn native_sdk_appkit_set_webview_navigation_callback(host: *AppKitHost, callback: AppKitWebViewNavigationCallback, context: ?*anyopaque) void;
 extern fn native_sdk_appkit_bridge_respond(host: *AppKitHost, response: [*]const u8, response_len: usize) void;
 extern fn native_sdk_appkit_bridge_respond_window(host: *AppKitHost, window_id: u64, response: [*]const u8, response_len: usize) void;
 extern fn native_sdk_appkit_bridge_respond_webview(host: *AppKitHost, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, response: [*]const u8, response_len: usize) void;
@@ -674,6 +676,7 @@ pub const MacPlatform = struct {
             .gpu_surfaces,
             .gpu_surface_scroll_drivers,
             .view_surface_adoption,
+            .webview_navigation_events,
             // Audio lives in the AppKit host (one AVPlayer for local
             // files and streamed URL sources); the Chromium host stubs
             // the C ABI and reports honestly unsupported rather than
@@ -696,6 +699,7 @@ pub const MacPlatform = struct {
             .handler_context = handler_context,
         };
         native_sdk_appkit_set_bridge_callback(self.host, appkitBridgeCallback, &self.state);
+        native_sdk_appkit_set_webview_navigation_callback(self.host, appkitWebViewNavigationCallback, &self.state);
         native_sdk_appkit_set_tray_callback(self.host, appkitTrayCallback, &self.state);
         native_sdk_appkit_run(self.host, appkitCallback, &self.state);
         if (self.state.failed) return error.CallbackFailed;
@@ -716,6 +720,7 @@ const RunState = struct {
     handler: ?platform_mod.EventHandler = null,
     handler_context: ?*anyopaque = null,
     failed: bool = false,
+    webview_navigation: platform_mod.webview_navigation.Tracker = .{},
 
     fn emit(self: *RunState, event: platform_mod.Event) void {
         const handler = self.handler orelse return;
@@ -732,6 +737,41 @@ const RunState = struct {
         };
     }
 };
+
+fn emitTrackedWebViewNavigation(context: *anyopaque, event: platform_mod.WebViewNavigationEvent) !void {
+    const state: *RunState = @ptrCast(@alignCast(context));
+    state.emit(.{ .webview_navigation = event });
+}
+
+fn appkitWebViewNavigationCallback(context: ?*anyopaque, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, engine_id: u64, phase: c_int, url: [*]const u8, url_len: usize, failure_class: c_int) callconv(.c) void {
+    const state: *RunState = @ptrCast(@alignCast(context.?));
+    const raw_phase = std.enums.fromInt(platform_mod.webview_navigation.RawPhase, phase) orelse {
+        state.failed = true;
+        return;
+    };
+    const mapped_failure: ?platform_mod.WebViewNavigationFailureClass = switch (failure_class) {
+        -1 => null,
+        0 => .network,
+        1 => .tls,
+        2 => .unknown,
+        else => {
+            state.failed = true;
+            return;
+        },
+    };
+    state.webview_navigation.ingest(.{
+        .window_id = window_id,
+        .label = webview_label[0..webview_label_len],
+        .engine_id = engine_id,
+        .phase = raw_phase,
+        .url = url[0..url_len],
+        .failure_class = mapped_failure,
+    }, state, emitTrackedWebViewNavigation) catch |err| {
+        std.debug.print("platform callback failed: {s} (event webview_navigation)\n", .{@errorName(err)});
+        state.failed = true;
+        if (state.self) |mac| native_sdk_appkit_stop(mac.host);
+    };
+}
 
 fn appkitCallback(context: ?*anyopaque, event: *const AppKitEvent) callconv(.c) void {
     const state: *RunState = @ptrCast(@alignCast(context.?));
@@ -761,6 +801,14 @@ fn appkitCallback(context: ?*anyopaque, event: *const AppKitEvent) callconv(.c) 
                 platform_mod.WindowOptions{ .id = event.window_id, .label = event_label, .title = mac.app_info.resolvedWindowTitle() }
             else
                 mac.windowById(event.window_id);
+            if (event.open == 0) {
+                state.webview_navigation.cancelAndRetireWindow(event.window_id, state, emitTrackedWebViewNavigation) catch |err| {
+                    std.debug.print("platform callback failed: {s} (event webview_navigation window teardown)\n", .{@errorName(err)});
+                    state.failed = true;
+                    native_sdk_appkit_stop(mac.host);
+                    return;
+                };
+            }
             state.emit(.{ .window_frame_changed = .{
                 .id = window.id,
                 .label = window.label,
@@ -1076,6 +1124,10 @@ fn focusWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!
 fn closeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
     const self: *MacPlatform = @ptrCast(@alignCast(context.?));
     if (native_sdk_appkit_close_window(self.host, window_id) == 0) return error.CloseFailed;
+    // A programmatic close can remove child views before WebKit delivers its
+    // cancellation callbacks. The tracker owns the exactly-one-terminal rule;
+    // the open=false callback above may already have retired these slots.
+    try self.state.webview_navigation.cancelAndRetireWindow(window_id, &self.state, emitTrackedWebViewNavigation);
 }
 
 fn minimizeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
@@ -1611,6 +1663,9 @@ fn setWebViewLayer(context: ?*anyopaque, window_id: platform_mod.WindowId, label
 fn closeWebView(context: ?*anyopaque, window_id: platform_mod.WindowId, label: []const u8) anyerror!void {
     const self: *MacPlatform = @ptrCast(@alignCast(context.?));
     if (native_sdk_appkit_close_webview(self.host, window_id, label.ptr, label.len) == 0) return error.WebViewNotFound;
+    // The host has confirmed removal, so an active load can no longer finish.
+    // Emit its terminal cancellation before releasing the fixed tracker slot.
+    try self.state.webview_navigation.cancelAndRetire(window_id, label, &self.state, emitTrackedWebViewNavigation);
 }
 
 fn showNotification(context: ?*anyopaque, options: platform_mod.NotificationOptions) anyerror!void {
@@ -1888,6 +1943,7 @@ test "macos chromium reports unsupported native surfaces" {
     try std.testing.expect(MacPlatform.supportsFeature(&system, .menus));
     try std.testing.expect(MacPlatform.supportsFeature(&system, .gpu_surfaces));
     try std.testing.expect(MacPlatform.supportsFeature(&system, .view_surface_adoption));
+    try std.testing.expect(MacPlatform.supportsFeature(&system, .webview_navigation_events));
 
     var chromium = testPlatformWithEngine(.chromium);
     try std.testing.expect(MacPlatform.supportsFeature(&chromium, .main_webview));
@@ -1900,6 +1956,7 @@ test "macos chromium reports unsupported native surfaces" {
     try std.testing.expect(!MacPlatform.supportsFeature(&chromium, .file_drops));
     try std.testing.expect(!MacPlatform.supportsFeature(&chromium, .gpu_surfaces));
     try std.testing.expect(!MacPlatform.supportsFeature(&chromium, .view_surface_adoption));
+    try std.testing.expect(!MacPlatform.supportsFeature(&chromium, .webview_navigation_events));
 }
 
 fn testPlatformWithEngine(web_engine: platform_mod.WebEngine) MacPlatform {

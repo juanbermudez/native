@@ -101,6 +101,7 @@ const WindowsEvent = extern struct {
 
 const WindowsCallback = *const fn (context: ?*anyopaque, event: *const WindowsEvent) callconv(.c) void;
 const WindowsBridgeCallback = *const fn (context: ?*anyopaque, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, message: [*]const u8, message_len: usize, origin: [*]const u8, origin_len: usize) callconv(.c) void;
+const WindowsWebViewNavigationCallback = *const fn (context: ?*anyopaque, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, engine_id: u64, phase: c_int, url: [*]const u8, url_len: usize, failure_class: c_int) callconv(.c) void;
 
 const shortcut_modifier_primary: u32 = 1 << 0;
 const shortcut_modifier_command: u32 = 1 << 1;
@@ -118,6 +119,7 @@ extern fn native_sdk_windows_decode_image(bytes: [*]const u8, bytes_len: usize, 
 extern fn native_sdk_windows_load_webview(host: *WindowsHost, source: [*]const u8, source_len: usize, source_kind: c_int, asset_root: [*]const u8, asset_root_len: usize, asset_entry: [*]const u8, asset_entry_len: usize, asset_origin: [*]const u8, asset_origin_len: usize, spa_fallback: c_int) void;
 extern fn native_sdk_windows_load_window_webview(host: *WindowsHost, window_id: u64, source: [*]const u8, source_len: usize, source_kind: c_int, asset_root: [*]const u8, asset_root_len: usize, asset_entry: [*]const u8, asset_entry_len: usize, asset_origin: [*]const u8, asset_origin_len: usize, spa_fallback: c_int) void;
 extern fn native_sdk_windows_set_bridge_callback(host: *WindowsHost, callback: WindowsBridgeCallback, context: ?*anyopaque) void;
+extern fn native_sdk_windows_set_webview_navigation_callback(host: *WindowsHost, callback: WindowsWebViewNavigationCallback, context: ?*anyopaque) void;
 extern fn native_sdk_windows_bridge_respond(host: *WindowsHost, response: [*]const u8, response_len: usize) void;
 extern fn native_sdk_windows_bridge_respond_window(host: *WindowsHost, window_id: u64, response: [*]const u8, response_len: usize) void;
 extern fn native_sdk_windows_bridge_respond_webview(host: *WindowsHost, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, response: [*]const u8, response_len: usize) void;
@@ -351,6 +353,7 @@ pub const WindowsPlatform = struct {
             .file_drops,
             .app_activation_events,
             .gpu_surfaces,
+            .webview_navigation_events,
             .audio_playback,
             .audio_streaming,
             => self.web_engine == .system,
@@ -384,6 +387,7 @@ pub const WindowsPlatform = struct {
             .handler_context = handler_context,
         };
         native_sdk_windows_set_bridge_callback(self.host, windowsBridgeCallback, &self.state);
+        native_sdk_windows_set_webview_navigation_callback(self.host, windowsWebViewNavigationCallback, &self.state);
         native_sdk_windows_run(self.host, windowsCallback, &self.state);
         if (self.state.failed) return error.CallbackFailed;
     }
@@ -403,6 +407,7 @@ const RunState = struct {
     handler: ?platform_mod.EventHandler = null,
     handler_context: ?*anyopaque = null,
     failed: bool = false,
+    webview_navigation: platform_mod.webview_navigation.Tracker = .{},
 
     fn emit(self: *RunState, event: platform_mod.Event) void {
         const handler = self.handler orelse return;
@@ -413,6 +418,43 @@ const RunState = struct {
         };
     }
 };
+
+fn emitTrackedWebViewNavigation(context: *anyopaque, event: platform_mod.WebViewNavigationEvent) !void {
+    const state: *RunState = @ptrCast(@alignCast(context));
+    state.emit(.{ .webview_navigation = event });
+}
+
+fn windowsWebViewNavigationCallback(context: ?*anyopaque, window_id: u64, webview_label: [*]const u8, webview_label_len: usize, engine_id: u64, phase: c_int, url: [*]const u8, url_len: usize, failure_class: c_int) callconv(.c) void {
+    const state: *RunState = @ptrCast(@alignCast(context.?));
+    const raw_phase = std.enums.fromInt(platform_mod.webview_navigation.RawPhase, phase) orelse {
+        state.failed = true;
+        if (state.self) |windows| native_sdk_windows_stop(windows.host);
+        return;
+    };
+    const mapped_failure: ?platform_mod.WebViewNavigationFailureClass = switch (failure_class) {
+        -1 => null,
+        0 => .network,
+        1 => .tls,
+        2 => .unknown,
+        else => {
+            state.failed = true;
+            if (state.self) |windows| native_sdk_windows_stop(windows.host);
+            return;
+        },
+    };
+    state.webview_navigation.ingest(.{
+        .window_id = window_id,
+        .label = webview_label[0..webview_label_len],
+        .engine_id = engine_id,
+        .phase = raw_phase,
+        .url = url[0..url_len],
+        .failure_class = mapped_failure,
+    }, state, emitTrackedWebViewNavigation) catch |err| {
+        std.debug.print("platform callback failed: {s} (event webview_navigation)\n", .{@errorName(err)});
+        state.failed = true;
+        if (state.self) |windows| native_sdk_windows_stop(windows.host);
+    };
+}
 
 fn windowsCallback(context: ?*anyopaque, event: *const WindowsEvent) callconv(.c) void {
     const state: *RunState = @ptrCast(@alignCast(context.?));
@@ -440,12 +482,32 @@ fn windowsCallback(context: ?*anyopaque, event: *const WindowsEvent) callconv(.c
             state.emit(.{ .surface_resized = surface });
         },
         .window_frame => if (state.self) |windows| {
-            const event_label = event.label[0..event.label_len];
-            const event_title = event.title[0..event.title_len];
+            if (event.label_len > platform_mod.max_window_label_bytes or event.title_len > platform_mod.max_window_title_bytes) {
+                state.failed = true;
+                native_sdk_windows_stop(windows.host);
+                return;
+            }
+            // Cancelling active child navigations can synchronously reenter
+            // window teardown. Own the event strings before that callback so
+            // the later window-frame delivery never reads freed host memory.
+            var event_label_buffer: [platform_mod.max_window_label_bytes]u8 = undefined;
+            var event_title_buffer: [platform_mod.max_window_title_bytes]u8 = undefined;
+            @memcpy(event_label_buffer[0..event.label_len], event.label[0..event.label_len]);
+            @memcpy(event_title_buffer[0..event.title_len], event.title[0..event.title_len]);
+            const event_label = event_label_buffer[0..event.label_len];
+            const event_title = event_title_buffer[0..event.title_len];
             const window = if (event_label.len > 0)
                 platform_mod.WindowOptions{ .id = event.window_id, .label = event_label, .title = event_title }
             else
                 windows.windowById(event.window_id);
+            if (event.open == 0) {
+                state.webview_navigation.cancelAndRetireWindow(event.window_id, state, emitTrackedWebViewNavigation) catch |err| {
+                    std.debug.print("platform callback failed: {s} (event webview_navigation window teardown)\n", .{@errorName(err)});
+                    state.failed = true;
+                    native_sdk_windows_stop(windows.host);
+                    return;
+                };
+            }
             state.emit(.{ .window_frame_changed = .{
                 .id = window.id,
                 .label = window.label,
@@ -718,6 +780,9 @@ fn focusWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!
 fn closeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
     const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
     if (native_sdk_windows_close_window(self.host, window_id) == 0) return error.CloseFailed;
+    // WM_DESTROY normally retires the window first; this second pass covers
+    // host paths that remove the renderer before an observed frame callback.
+    try self.state.webview_navigation.cancelAndRetireWindow(window_id, &self.state, emitTrackedWebViewNavigation);
 }
 
 fn minimizeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
@@ -959,6 +1024,7 @@ fn closeWebView(context: ?*anyopaque, window_id: platform_mod.WindowId, label: [
     const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
     if (std.mem.eql(u8, label, "main")) return error.InvalidWebViewOptions;
     if (native_sdk_windows_close_webview(self.host, window_id, label.ptr, label.len) == 0) return error.WebViewNotFound;
+    try self.state.webview_navigation.cancelAndRetire(window_id, label, &self.state, emitTrackedWebViewNavigation);
 }
 
 fn showOpenDialog(context: ?*anyopaque, options: platform_mod.OpenDialogOptions, buffer: []u8) anyerror!platform_mod.OpenDialogResult {
@@ -1437,6 +1503,7 @@ test "windows chromium reports unsupported native surfaces" {
     try std.testing.expect(WindowsPlatform.supportsFeature(&system, .gpu_surfaces));
     try std.testing.expect(WindowsPlatform.supportsFeature(&system, .audio_playback));
     try std.testing.expect(WindowsPlatform.supportsFeature(&system, .audio_streaming));
+    try std.testing.expect(WindowsPlatform.supportsFeature(&system, .webview_navigation_events));
 
     var chromium = testPlatformWithEngine(.chromium);
     try std.testing.expect(!WindowsPlatform.supportsFeature(&chromium, .main_webview));
@@ -1448,6 +1515,7 @@ test "windows chromium reports unsupported native surfaces" {
     try std.testing.expect(!WindowsPlatform.supportsFeature(&chromium, .gpu_surfaces));
     try std.testing.expect(!WindowsPlatform.supportsFeature(&chromium, .audio_playback));
     try std.testing.expect(!WindowsPlatform.supportsFeature(&chromium, .audio_streaming));
+    try std.testing.expect(!WindowsPlatform.supportsFeature(&chromium, .webview_navigation_events));
 }
 
 test "windows audio event maps kinds and payload" {

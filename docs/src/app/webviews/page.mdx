@@ -63,6 +63,25 @@ When a parent window closes, its child WebViews are closed with it. Child WebVie
 
 WebView slots are capped globally per runtime, not per window. The default cap is 16 child WebViews.
 
+### Navigation events
+
+Trusted chrome can observe a child WebView's correlated main-frame lifecycle:
+
+```javascript
+window.zero.on("webview:navigation", (detail) => {
+  // detail.navigationId is an opaque u64 serialized as a string.
+  // phase: started | redirected | finished | failed | cancelled
+  console.log(detail.label, detail.navigationId, detail.phase, detail.url);
+  if (detail.phase === "failed") console.log(detail.failureClass);
+});
+```
+
+Gate lifecycle-dependent UI with `await window.zero.platform.supports("webviewNavigationEvents")`; the snake-case name `webview_navigation_events` is equivalent.
+
+Redirects retain one `navigationId`. A replacement navigation emits `cancelled` for the prior id before the replacement's `started`, and every accepted id emits exactly one terminal phase (`finished`, `failed`, or `cancelled`). Closing a loading child WebView, or its parent window, terminates the active id with `cancelled` before releasing its lifecycle slot. `failureClass` is present only on `failed` and is bounded to `network`, `tls`, or `unknown`; engine-specific error codes are not exposed. Iframes and subresources do not emit records.
+
+The older `webview:navigate` event remains available with `{ windowId, label, url }` on `started` and `redirected`. It is a compatibility notification, not load-completion proof.
+
 ## Commands
 
 The helper calls these built-in bridge commands internally:
@@ -118,4 +137,4 @@ WebView URLs are checked against the runtime navigation policy before native vie
 
 ## Backend Support
 
-System WebView stacks are implemented on macOS and Linux with layers, best-effort transparency, bridge-enabled trusted child WebViews, targeted bridge responses, and page zoom. Windows WebView2 child WebViews are in progress: child layers, navigation, and bridge-enabled trusted child WebViews are available when WebView2 is installed, but `main` WebView frame/zoom/layer operations reject with explicit unsupported-backend errors. macOS CEF supports layered child WebViews, page zoom, and bridge-enabled trusted child WebViews. Linux CEF explicitly rejects child WebView creation until native CEF embedding is wired in.
+System WebView stacks are implemented on macOS and Linux with layers, best-effort transparency, bridge-enabled trusted child WebViews, targeted bridge responses, and page zoom. The correlated `webview:navigation` lifecycle has engine adapters in the macOS system host, Windows WebView2, and Linux WebKitGTK. The single Python executable matrix passes process-locally on macOS and is wired into both the Linux and pinned `windows-2022` jobs. Neither updated hosted run has yet been observed green, so unified-runner evidence is not claimed for Linux or Windows; cross-builds do not provide runtime proof. The matrix also requires encoded local-asset URLs to remain public and byte-preserving, with no private WebView2 transport origin or reserved-`main` lifecycle leak. Windows WebView2 child layers, navigation, and bridge-enabled trusted child WebViews are available when WebView2 is installed, but `main` WebView frame/zoom/layer operations reject with explicit unsupported-backend errors. macOS CEF supports layered child WebViews, page zoom, and bridge-enabled trusted child WebViews, but its correlated lifecycle is deliberately unsupported: ordinary CEF 144 load callbacks cannot correlate a delayed terminal across same-URL replacement, and teardown must reach every `OnBeforeClose` before `CefShutdown`. Any CEF lifecycle attempt requires a separate design record and pinned-runtime identity/teardown spike. Linux CEF explicitly rejects child WebView creation until native CEF embedding is wired in.

@@ -383,6 +383,13 @@ test "runtime handles built-in JavaScript platform support commands" {
     } });
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"result\":false") != null);
 
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"navigation\",\"command\":\"native-sdk.platform.supports\",\"payload\":{\"feature\":\"webviewNavigationEvents\"}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"result\":false") != null);
+
     var chromium_platform = platform.NullPlatform.initWithEngine(.{}, .chromium);
     harness.runtime.options.platform = chromium_platform.platform();
     try std.testing.expect(!harness.runtime.supports(.tray));

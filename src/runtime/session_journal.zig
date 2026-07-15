@@ -70,8 +70,9 @@ pub const magic = "NSDKSJNL";
 /// enum orders bumps this; readers refuse other versions loudly rather
 /// than misreading yesterday's shape. v2 added the stream `buffering`
 /// flag to audio event and audio effect records; v3 added the spectrum
-/// band bytes to both (and the `.spectrum` audio kind).
-pub const format_version: u32 = 3;
+/// band bytes to both (and the `.spectrum` audio kind); v4 added the
+/// cross-platform WebView navigation lifecycle event.
+pub const format_version: u32 = 4;
 
 // ------------------------------------------------------------- budgets
 //
@@ -324,6 +325,7 @@ const EventTag = enum(u8) {
     context_menu_action = 22,
     widget_accessibility_action = 23,
     audio = 24,
+    webview_navigation = 25,
 };
 
 fn writeModifiers(cursor: *WriteCursor, modifiers: platform.ShortcutModifiers) JournalError!void {
@@ -471,6 +473,16 @@ pub fn encodeEvent(event: platform.Event, buffer: []u8) JournalError![]const u8 
             try cursor.writeBool(audio.playing);
             try cursor.writeBool(audio.buffering);
             try cursor.writeBytes(&audio.bands);
+        },
+        .webview_navigation => |navigation| {
+            try cursor.writeEnum(EventTag.webview_navigation);
+            try cursor.writeInt(u64, navigation.window_id);
+            try cursor.writeStr(navigation.label);
+            try cursor.writeInt(u64, navigation.navigation_id);
+            try cursor.writeEnum(navigation.phase);
+            try cursor.writeStr(navigation.url);
+            try cursor.writeBool(navigation.failure_class != null);
+            if (navigation.failure_class) |failure_class| try cursor.writeEnum(failure_class);
         },
         .files_dropped => |drop| {
             try cursor.writeEnum(EventTag.files_dropped);
@@ -667,6 +679,23 @@ pub fn decodeEvent(bytes: []const u8, storage: *EventDecodeStorage) JournalError
             };
             @memcpy(&decoded.bands, try cursor.readBytes(decoded.bands.len));
             break :blk .{ .audio = decoded };
+        },
+        .webview_navigation => blk: {
+            const window_id = try cursor.readInt(u64);
+            const label = try cursor.readStr();
+            const navigation_id = try cursor.readInt(u64);
+            const phase = try cursor.readEnum(platform.WebViewNavigationPhase);
+            const url = try cursor.readStr();
+            const failure_class = if (try cursor.readBool()) try cursor.readEnum(platform.WebViewNavigationFailureClass) else null;
+            if ((phase == .failed) != (failure_class != null)) return error.JournalCorrupt;
+            break :blk .{ .webview_navigation = .{
+                .window_id = window_id,
+                .label = label,
+                .navigation_id = navigation_id,
+                .phase = phase,
+                .url = url,
+                .failure_class = failure_class,
+            } };
         },
         .files_dropped => blk: {
             const window_id = try cursor.readInt(u64);
@@ -1274,6 +1303,44 @@ test "event codec round-trips every payload variant" {
         } });
         try testing.expectEqual(@as(f32, 640), decoded.gpu_surface_resized.frame.width);
     }
+    {
+        const decoded = try roundTripEvent(.{ .webview_navigation = .{
+            .window_id = 3,
+            .label = "page-tab-1",
+            .navigation_id = std.math.maxInt(u64),
+            .phase = .failed,
+            .url = "https://example.com/final",
+            .failure_class = .tls,
+        } });
+        try testing.expectEqual(@as(u64, 3), decoded.webview_navigation.window_id);
+        try testing.expectEqualStrings("page-tab-1", decoded.webview_navigation.label);
+        try testing.expectEqual(std.math.maxInt(u64), decoded.webview_navigation.navigation_id);
+        try testing.expectEqual(platform.WebViewNavigationPhase.failed, decoded.webview_navigation.phase);
+        try testing.expectEqual(platform.WebViewNavigationFailureClass.tls, decoded.webview_navigation.failure_class.?);
+    }
+}
+
+test "navigation journal rejects failure-class shape mismatches" {
+    var buffer: [256]u8 = undefined;
+    var storage: EventDecodeStorage = .{};
+    const failed_without_class = try encodeEvent(.{ .webview_navigation = .{
+        .window_id = 1,
+        .label = "page",
+        .navigation_id = 1,
+        .phase = .failed,
+        .url = "https://example.com/",
+    } }, &buffer);
+    try testing.expectError(error.JournalCorrupt, decodeEvent(failed_without_class, &storage));
+
+    const finished_with_class = try encodeEvent(.{ .webview_navigation = .{
+        .window_id = 1,
+        .label = "page",
+        .navigation_id = 2,
+        .phase = .finished,
+        .url = "https://example.com/",
+        .failure_class = .network,
+    } }, &buffer);
+    try testing.expectError(error.JournalCorrupt, decodeEvent(finished_with_class, &storage));
 }
 
 test "effect codec round-trips payloads and outcomes" {

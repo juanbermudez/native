@@ -171,6 +171,11 @@ test "null platform records loaded webview source" {
     try std.testing.expectEqualStrings("<h1>Hello</h1>", null_platform.loaded_source.?.bytes);
 }
 
+test "null platform reports navigation lifecycle unsupported" {
+    var null_platform = NullPlatform.init(.{});
+    try std.testing.expect(!null_platform.platform().supports(.webview_navigation_events));
+}
+
 test "null platform records bridge response window routing" {
     var null_platform = NullPlatform.init(.{});
     try null_platform.platform().services.completeWindowBridge(7, "{\"ok\":true}");

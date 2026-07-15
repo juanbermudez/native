@@ -613,7 +613,8 @@ pub fn build(b: *std.Build) void {
     });
     addFileContainsCheckStep(b, file_contains_checker, test_step, "test-windows-packaged-assets-webview2", "Verify Windows packaged assets are served through WebView2 request interception", &.{
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "constexpr const char *kAssetVirtualOrigin = \"https://native-sdk-app.localhost\";" },
-        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "return virtualAssetEntryUrl(webview.asset_entry);" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "const std::string tail = webview.url.substr(public_origin.size());" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "return std::string(kAssetVirtualOrigin) + tail;" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "AddWebResourceRequestedFilter(L\"https://native-sdk-app.localhost/*\"" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "assetWebResourceResponse(environment_ref.Get(), found->second, uri)" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "bridgeOriginForWebViewUrl(source_webview->second, source_url)" },
@@ -1203,63 +1204,12 @@ pub fn build(b: *std.Build) void {
     const webview_cef_link_step = b.step("test-webview-cef-link", "Build the WebView example with Chromium/CEF");
     webview_cef_link_step.dependOn(&build_webview_cef.step);
 
-    const webview_smoke_step = b.step("test-webview-smoke", "Run macOS WebView automation smoke test");
-    const webview_smoke_build = b.addSystemCommand(&.{ "zig", "build", "-Dplatform=macos", "-Dweb-engine=system", "-Dautomation=true", "-Djs-bridge=true" });
+    const webview_smoke_step = b.step("test-webview-smoke", "Run system WebView automation smoke test");
+    const webview_smoke_build = b.addSystemCommand(&.{ "zig", "build", b.fmt("-Dplatform={s}", .{platform_arg}), "-Dweb-engine=system", "-Dautomation=true", "-Djs-bridge=true" });
     webview_smoke_build.setCwd(b.path("examples/webview"));
-    const webview_smoke_run = b.addSystemCommand(&.{
-        "sh", "-c",
-        \\set -eu
-        \\cd examples/webview
-        \\app="zig-out/bin/webview"
-        \\cli="$1"
-        \\case "$cli" in /*) ;; *) cli="../../$cli" ;; esac
-        \\request='{"id":"smoke","command":"native.ping","payload":{"source":"smoke"}}'
-        \\response_file=".zig-cache/native-sdk-automation/bridge-response.txt"
-        \\mkdir -p .zig-cache/native-sdk-automation
-        \\rm -f .zig-cache/native-sdk-automation/snapshot.txt .zig-cache/native-sdk-automation/windows.txt .zig-cache/native-sdk-automation/command*.txt "$response_file"
-        \\printf 'bridge %s\n' "$request" > .zig-cache/native-sdk-automation/command-1.txt
-        \\"$app" > .zig-cache/native-sdk-webview-smoke.log 2>&1 &
-        \\pid=$!
-        \\trap 'status=$?; kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; if [ "$status" -ne 0 ]; then echo "---- app log (.zig-cache/native-sdk-webview-smoke.log) ----" >&2; cat .zig-cache/native-sdk-webview-smoke.log >&2 2>/dev/null || true; fi' EXIT
-        \\snapshot="$("$cli" automate wait 2>&1)"
-        \\case "$snapshot" in *"ready=true"*) ;; *) echo "automation snapshot was not ready" >&2; exit 1 ;; esac
-        \\attempts=0
-        \\while [ "$attempts" -lt 50 ] && ! grep -q 'name="webview.load"' .zig-cache/native-sdk-webview-smoke.log; do attempts=$((attempts + 1)); sleep 0.1; done
-        \\grep -q 'name="webview.load"' .zig-cache/native-sdk-webview-smoke.log || { echo "main window never loaded its webview source (blank window)" >&2; exit 1; }
-        \\if grep -q 'name="dispatch.error"' .zig-cache/native-sdk-webview-smoke.log; then echo "runtime recorded a dispatch error during startup" >&2; exit 1; fi
-        \\attempts=0
-        \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
-        \\response="$(cat "$response_file" 2>/dev/null || true)"
-        \\case "$response" in *'"ok":true'*) ;; *) echo "native.ping did not succeed: $response" >&2; exit 1 ;; esac
-        \\case "$response" in *'pong from Zig'*) ;; *) echo "native.ping response was unexpected: $response" >&2; exit 1 ;; esac
-        \\rm -f "$response_file"
-        \\printf 'bridge %s\n' '{"id":"webview-create","command":"native-sdk.webview.create","payload":{"label":"smoke","url":"https://example.com","frame":{"x":24,"y":24,"width":320,"height":220}}}' > .zig-cache/native-sdk-automation/command-1.txt
-        \\attempts=0
-        \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
-        \\response="$(cat "$response_file" 2>/dev/null || true)"
-        \\case "$response" in *'"ok":true'*) ;; *) echo "webview create did not succeed: $response" >&2; exit 1 ;; esac
-        \\rm -f "$response_file"
-        \\printf 'bridge %s\n' '{"id":"webview-resize","command":"native-sdk.webview.setFrame","payload":{"label":"smoke","frame":{"x":36,"y":36,"width":420,"height":260}}}' > .zig-cache/native-sdk-automation/command-1.txt
-        \\attempts=0
-        \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
-        \\response="$(cat "$response_file" 2>/dev/null || true)"
-        \\case "$response" in *'"ok":true'*) ;; *) echo "webview resize did not succeed: $response" >&2; exit 1 ;; esac
-        \\rm -f "$response_file"
-        \\printf 'bridge %s\n' '{"id":"webview-navigate","command":"native-sdk.webview.navigate","payload":{"label":"smoke","url":"https://example.com/?smoke=1"}}' > .zig-cache/native-sdk-automation/command-1.txt
-        \\attempts=0
-        \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
-        \\response="$(cat "$response_file" 2>/dev/null || true)"
-        \\case "$response" in *'"ok":true'*) ;; *) echo "webview navigate did not succeed: $response" >&2; exit 1 ;; esac
-        \\rm -f "$response_file"
-        \\printf 'bridge %s\n' '{"id":"webview-close","command":"native-sdk.webview.close","payload":{"label":"smoke"}}' > .zig-cache/native-sdk-automation/command-1.txt
-        \\attempts=0
-        \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
-        \\response="$(cat "$response_file" 2>/dev/null || true)"
-        \\case "$response" in *'"ok":true'*) ;; *) echo "webview close did not succeed: $response" >&2; exit 1 ;; esac
-        \\echo "webview smoke ok"
-        ,
-        "sh",
-    });
+    const python_exe = if (b.graph.host.result.os.tag == .windows) "python" else "python3";
+    const webview_exe_name = if (b.graph.host.result.os.tag == .windows) "webview.exe" else "webview";
+    const webview_smoke_run = b.addSystemCommand(&.{ python_exe, "tests/webview-navigation-smoke.py", "--app", b.pathFromRoot(b.fmt("examples/webview/zig-out/bin/{s}", .{webview_exe_name})), "--cli" });
     webview_smoke_run.addFileArg(cli_exe.getEmittedBin());
     webview_smoke_run.step.dependOn(&webview_smoke_build.step);
     webview_smoke_run.step.dependOn(&cli_exe.step);

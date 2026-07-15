@@ -161,12 +161,16 @@ pub const WidgetAccessibilityActionEvent = types.WidgetAccessibilityActionEvent;
 pub const ClipboardData = types.ClipboardData;
 pub const ColorScheme = types.ColorScheme;
 pub const Appearance = types.Appearance;
+pub const WebViewNavigationPhase = types.WebViewNavigationPhase;
+pub const WebViewNavigationFailureClass = types.WebViewNavigationFailureClass;
+pub const WebViewNavigationEvent = types.WebViewNavigationEvent;
 pub const Event = types.Event;
 pub const splitDropPaths = types.splitDropPaths;
 pub const EventHandler = types.EventHandler;
 pub const PlatformServices = types.PlatformServices;
 pub const Platform = types.Platform;
 pub const Backend = types.Backend;
+pub const webview_navigation = @import("webview_navigation.zig");
 
 pub const NullPlatform = null_backend.NullPlatform;
 pub const NullTimer = null_backend.NullTimer;

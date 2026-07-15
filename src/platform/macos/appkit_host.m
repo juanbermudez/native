@@ -758,8 +758,10 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 @property(nonatomic, strong) NSString *windowLabel;
 @property(nonatomic, assign) native_sdk_appkit_event_callback_t callback;
 @property(nonatomic, assign) native_sdk_appkit_bridge_callback_t bridgeCallback;
+@property(nonatomic, assign) native_sdk_appkit_webview_navigation_callback_t webViewNavigationCallback;
 @property(nonatomic, assign) void *context;
 @property(nonatomic, assign) void *bridgeContext;
+@property(nonatomic, assign) void *webViewNavigationContext;
 @property(nonatomic, assign) BOOL didShutdown;
 @property(nonatomic, assign) BOOL observesApplicationActivation;
 @property(nonatomic, assign) BOOL observesAppearanceChanges;
@@ -890,7 +892,8 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 - (void)setAllowedNavigationOrigins:(NSArray<NSString *> *)origins externalURLs:(NSArray<NSString *> *)externalURLs externalAction:(NSInteger)externalAction;
 - (BOOL)allowsNavigationURL:(NSURL *)url;
 - (BOOL)openExternalURLIfAllowed:(NSURL *)url;
-- (void)emitNavigationForWebView:(WKWebView *)webView url:(NSURL *)url;
+- (BOOL)childWebView:(WKWebView *)webView windowId:(uint64_t *)windowId label:(NSString **)label;
+- (void)emitNavigationForWebView:(WKWebView *)webView navigation:(WKNavigation *)navigation phase:(int)phase url:(NSURL *)url failureClass:(int)failureClass;
 - (void)receiveBridgeMessage:(WKScriptMessage *)message windowId:(uint64_t)windowId webViewLabel:(NSString *)webViewLabel;
 - (void)completeBridgeWithResponse:(NSString *)response;
 - (void)completeBridgeWithResponse:(NSString *)response windowId:(uint64_t)windowId;
@@ -9234,35 +9237,52 @@ static int NativeSdkSpectrumComputeBands(native_sdk_spectrum_tap_state_t *state,
     return YES;
 }
 
-- (void)emitNavigationForWebView:(WKWebView *)webView url:(NSURL *)url {
-    if (!webView || !url) return;
-    uint64_t windowId = 1;
-    NSString *label = @"main";
-    for (NSNumber *key in self.webViews) {
-        if (self.webViews[key] != webView) continue;
-        windowId = key.unsignedLongLongValue;
-        label = @"main";
-        break;
-    }
+- (BOOL)childWebView:(WKWebView *)webView windowId:(uint64_t *)windowId label:(NSString **)label {
+    if (!webView || !windowId || !label) return NO;
     for (NSString *key in self.childWebViews) {
         if (self.childWebViews[key] != webView) continue;
         NSRange separator = [key rangeOfString:@":"];
-        if (separator.location != NSNotFound) {
-            windowId = (uint64_t)[[key substringToIndex:separator.location] longLongValue];
-            label = [key substringFromIndex:separator.location + 1];
-        }
-        break;
+        if (separator.location == NSNotFound) return NO;
+        *windowId = (uint64_t)[[key substringToIndex:separator.location] longLongValue];
+        *label = [key substringFromIndex:separator.location + 1];
+        return (*label).length > 0;
     }
-    if ([label isEqualToString:@"main"]) return;
-    NSDictionary *detail = @{ @"windowId": @(windowId), @"label": label, @"url": url.absoluteString ?: @"" };
-    NSData *data = [NSJSONSerialization dataWithJSONObject:detail options:0 error:nil];
-    if (!data) return;
-    NSString *json = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    [self emitEventNamed:@"webview:navigate" detailJSON:json ?: @"{}" windowId:windowId];
+    return NO;
+}
+
+- (void)emitNavigationForWebView:(WKWebView *)webView navigation:(WKNavigation *)navigation phase:(int)phase url:(NSURL *)url failureClass:(int)failureClass {
+    if (!webView || !navigation || !self.webViewNavigationCallback) return;
+    uint64_t windowId = 1;
+    NSString *label = nil;
+    if (![self childWebView:webView windowId:&windowId label:&label]) return;
+    NSString *urlString = url.absoluteString ?: @"";
+    NSData *urlData = [urlString dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *labelData = [label dataUsingEncoding:NSUTF8StringEncoding];
+    if (!urlData || !labelData) return;
+    uint64_t engineId = (uint64_t)(uintptr_t)(__bridge void *)navigation;
+    self.webViewNavigationCallback(
+        self.webViewNavigationContext,
+        windowId,
+        labelData.bytes,
+        labelData.length,
+        engineId,
+        phase,
+        urlData.bytes,
+        urlData.length,
+        failureClass
+    );
+}
+
+- (void)webView:(WKWebView *)webView didStartProvisionalNavigation:(WKNavigation *)navigation {
+    [self emitNavigationForWebView:webView navigation:navigation phase:0 url:webView.URL failureClass:-1];
+}
+
+- (void)webView:(WKWebView *)webView didReceiveServerRedirectForProvisionalNavigation:(WKNavigation *)navigation {
+    [self emitNavigationForWebView:webView navigation:navigation phase:1 url:webView.URL failureClass:-1];
 }
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
-    (void)navigation;
+    [self emitNavigationForWebView:webView navigation:navigation phase:2 url:webView.URL failureClass:-1];
     for (NSNumber *key in self.webViews) {
         if (self.webViews[key] == webView) {
             [self updateCoveredMouseRectsInWindow:key.unsignedLongLongValue];
@@ -9280,11 +9300,45 @@ static int NativeSdkSpectrumComputeBands(native_sdk_spectrum_tap_state_t *state,
     }
 }
 
+- (int)navigationFailureClassForError:(NSError *)error {
+    if (![error.domain isEqualToString:NSURLErrorDomain]) return 2;
+    switch (error.code) {
+        case NSURLErrorServerCertificateHasBadDate:
+        case NSURLErrorServerCertificateUntrusted:
+        case NSURLErrorServerCertificateHasUnknownRoot:
+        case NSURLErrorServerCertificateNotYetValid:
+        case NSURLErrorClientCertificateRejected:
+        case NSURLErrorClientCertificateRequired:
+        case NSURLErrorSecureConnectionFailed:
+        case NSURLErrorAppTransportSecurityRequiresSecureConnection:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+- (void)emitNavigationFailureForWebView:(WKWebView *)webView navigation:(WKNavigation *)navigation error:(NSError *)error {
+    id failingURL = error.userInfo[NSURLErrorFailingURLErrorKey];
+    NSURL *url = [failingURL isKindOfClass:[NSURL class]] ? (NSURL *)failingURL : webView.URL;
+    if (error.code == NSURLErrorCancelled && [error.domain isEqualToString:NSURLErrorDomain]) {
+        [self emitNavigationForWebView:webView navigation:navigation phase:4 url:url failureClass:-1];
+        return;
+    }
+    [self emitNavigationForWebView:webView navigation:navigation phase:3 url:url failureClass:[self navigationFailureClassForError:error]];
+}
+
+- (void)webView:(WKWebView *)webView didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    [self emitNavigationFailureForWebView:webView navigation:navigation error:error];
+}
+
+- (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    [self emitNavigationFailureForWebView:webView navigation:navigation error:error];
+}
+
 - (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
     NSURL *url = navigationAction.request.URL;
     if (!navigationAction.targetFrame || navigationAction.targetFrame.isMainFrame) {
         if ([self allowsNavigationURL:url]) {
-            [self emitNavigationForWebView:webView url:url];
             decisionHandler(WKNavigationActionPolicyAllow);
             return;
         }
@@ -9792,6 +9846,12 @@ void native_sdk_appkit_set_bridge_callback(native_sdk_appkit_host_t *host, nativ
     NativeSdkAppKitHost *object = (__bridge NativeSdkAppKitHost *)host;
     object.bridgeCallback = callback;
     object.bridgeContext = context;
+}
+
+void native_sdk_appkit_set_webview_navigation_callback(native_sdk_appkit_host_t *host, native_sdk_appkit_webview_navigation_callback_t callback, void *context) {
+    NativeSdkAppKitHost *object = (__bridge NativeSdkAppKitHost *)host;
+    object.webViewNavigationCallback = callback;
+    object.webViewNavigationContext = context;
 }
 
 void native_sdk_appkit_bridge_respond(native_sdk_appkit_host_t *host, const char *response, size_t response_len) {

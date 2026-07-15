@@ -160,7 +160,7 @@ pub fn main(init: std.process.Init) !void {
         .builtin_bridge = .{ .enabled = true, .commands = &builtin_policies },
         .security = .{
             .permissions = &app_permissions,
-            .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app", "https://example.com" } },
+            .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app", "https://example.com", "http://127.0.0.1:48765" } },
         },
     }, init);
 }

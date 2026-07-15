@@ -1947,6 +1947,12 @@ void native_sdk_appkit_set_bridge_callback(native_sdk_appkit_host_t *host, nativ
     object.bridgeContext = context;
 }
 
+void native_sdk_appkit_set_webview_navigation_callback(native_sdk_appkit_host_t *host, native_sdk_appkit_webview_navigation_callback_t callback, void *context) {
+    (void)host;
+    (void)callback;
+    (void)context;
+}
+
 void native_sdk_appkit_bridge_respond(native_sdk_appkit_host_t *host, const char *response, size_t response_len) {
     native_sdk_appkit_bridge_respond_window(host, 1, response, response_len);
 }

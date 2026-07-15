@@ -154,6 +154,18 @@ constexpr UINT kAudioSessionMessage = WM_APP + 45;
 constexpr UINT kAudioSpectrumMessage = WM_APP + 46;
 constexpr const char *kAssetVirtualOrigin = "https://native-sdk-app.localhost";
 
+/* Keep these C ABI ordinals aligned with webview_navigation.RawPhase and
+ * the bounded failure mapping in windows/root.zig. */
+constexpr int kWebViewNavigationStarted = 0;
+constexpr int kWebViewNavigationRedirected = 1;
+constexpr int kWebViewNavigationFinished = 2;
+constexpr int kWebViewNavigationFailed = 3;
+constexpr int kWebViewNavigationCancelled = 4;
+constexpr int kWebViewNavigationNoFailure = -1;
+constexpr int kWebViewNavigationFailureNetwork = 0;
+constexpr int kWebViewNavigationFailureTls = 1;
+constexpr int kWebViewNavigationFailureUnknown = 2;
+
 constexpr int kViewWebView = 0;
 constexpr int kViewToolbar = 1;
 constexpr int kViewTitlebarAccessory = 2;
@@ -280,6 +292,7 @@ struct WindowsMessageDialogOpts {
 
 using EventCallback = void (*)(void *, const WindowsEvent *);
 using BridgeCallback = void (*)(void *, uint64_t, const char *, size_t, const char *, size_t, const char *, size_t);
+using WebViewNavigationCallback = void (*)(void *, uint64_t, const char *, size_t, uint64_t, int, const char *, size_t, int);
 
 struct Window {
     uint64_t id = 1;
@@ -544,6 +557,8 @@ struct Host {
     void *callback_context = nullptr;
     BridgeCallback bridge_callback = nullptr;
     void *bridge_context = nullptr;
+    WebViewNavigationCallback webview_navigation_callback = nullptr;
+    void *webview_navigation_context = nullptr;
     bool running = false;
     std::map<uint64_t, Window> windows;
     std::map<std::string, ChildWebView> webviews;
@@ -912,21 +927,30 @@ static std::string virtualAssetEntryUrl(const std::string &entry) {
     return originAssetEntryUrl(entry, kAssetVirtualOrigin);
 }
 
-static std::string urlQueryOrFragmentSuffix(const std::string &url) {
-    size_t scheme_end = url.find("://");
-    size_t search_start = scheme_end == std::string::npos ? 0 : scheme_end + 3;
-    size_t suffix_start = url.find_first_of("?#", search_start);
-    return suffix_start == std::string::npos ? std::string() : url.substr(suffix_start);
-}
-
 static std::string assetEntryUrl(const ChildWebView &webview) {
-    if (!webview.url.empty() && originForUrl(webview.url) == assetOrigin(webview)) {
-        std::string relative;
-        if (assetRelativePathFromUrl(webview.url, webview.asset_entry, &relative)) {
-            return virtualAssetEntryUrl(relative) + urlQueryOrFragmentSuffix(webview.url);
-        }
+    const std::string entry_url = virtualAssetEntryUrl(webview.asset_entry);
+    if (webview.url.empty()) return entry_url;
+
+    std::string public_origin = assetOrigin(webview);
+    while (!public_origin.empty() && public_origin.back() == '/') public_origin.pop_back();
+    if (public_origin.empty() ||
+        originForUrl(webview.url) != public_origin ||
+        webview.url.rfind(public_origin, 0) != 0) {
+        return entry_url;
     }
-    return virtualAssetEntryUrl(webview.asset_entry);
+
+    // WebView2 navigates through a private HTTPS transport origin. Replace
+    // only the exact public origin and keep the caller's encoded path byte for
+    // byte; decoding and traversal checks belong to assetWebResourceResponse,
+    // where the path is mapped to the filesystem.
+    const std::string tail = webview.url.substr(public_origin.size());
+    if (tail.empty() || tail == "/") return entry_url;
+    if (tail.front() == '?' || tail.front() == '#') return entry_url + tail;
+    if (tail.size() > 1 && tail.front() == '/' && (tail[1] == '?' || tail[1] == '#')) {
+        return entry_url + tail.substr(1);
+    }
+    if (tail.front() != '/') return entry_url;
+    return std::string(kAssetVirtualOrigin) + tail;
 }
 
 static bool inheritAssetSourceForUrl(Host *host, uint64_t window_id, ChildWebView &webview, const std::string &url) {
@@ -951,6 +975,47 @@ static bool isInternalAssetUrl(const ChildWebView &webview, const std::string &u
 
 static std::string bridgeOriginForWebViewUrl(const ChildWebView &webview, const std::string &url) {
     return isInternalAssetUrl(webview, url) ? assetOrigin(webview) : originForUrl(url);
+}
+
+/* WebView2 sees the private HTTPS origin used to serve local assets. The
+ * public lifecycle must preserve the app-declared asset origin instead of
+ * leaking that transport detail to runtime consumers. */
+static std::string navigationEventUrl(const ChildWebView &webview, const std::string &url) {
+    if (!isInternalAssetUrl(webview, url) || originForUrl(url) != kAssetVirtualOrigin) return url;
+    if (url.rfind(kAssetVirtualOrigin, 0) != 0) return url;
+    std::string public_origin = assetOrigin(webview);
+    while (!public_origin.empty() && public_origin.back() == '/') public_origin.pop_back();
+    // Swap only the transport origin. Keeping the engine's encoded tail
+    // byte-for-byte avoids turning %20/%23/%3F/%25 into spaces, fragments,
+    // queries, or a different path in the public lifecycle URL.
+    return public_origin + url.substr(std::char_traits<char>::length(kAssetVirtualOrigin));
+}
+
+/* Snapshot every map-backed byte before crossing the Zig/application
+ * callback boundary. That callback is reentrant and may synchronously close
+ * this WebView, its parent window, or the whole host. Callers must return
+ * immediately after this function and must not reuse a map iterator. */
+static void emitWebViewNavigation(
+    Host *host,
+    const ChildWebView &webview,
+    uint64_t engine_id,
+    int phase,
+    const std::string &engine_url,
+    int failure_class) {
+    if (!host || !host->webview_navigation_callback) return;
+    WebViewNavigationCallback callback = host->webview_navigation_callback;
+    void *context = host->webview_navigation_context;
+    const uint64_t window_id = webview.window_id;
+    const std::string label = webview.label;
+    const std::string url = navigationEventUrl(webview, engine_url);
+    callback(context, window_id, label.data(), label.size(), engine_id, phase, url.data(), url.size(), failure_class);
+}
+
+/* A required WebView2 correlation getter failing is a host-contract failure,
+ * not permission to manufacture a lifecycle. Feed an invalid engine id to
+ * the shared tracker so the Zig boundary latches CallbackFailed loudly. */
+static void emitInvalidWebViewNavigation(Host *host, const ChildWebView &webview, int phase) {
+    emitWebViewNavigation(host, webview, 0, phase, std::string(), kWebViewNavigationNoFailure);
 }
 
 static std::wstring assetFilePath(const ChildWebView &webview, const std::string &relative) {
@@ -3936,16 +4001,19 @@ static bool handleAudioTimerMessage(Host *host, WPARAM wparam) {
 
 static void destroyChildWebViewsForWindow(Host *host, uint64_t window_id) {
     if (!host) return;
-    for (auto it = host->webviews.begin(); it != host->webviews.end();) {
-        if (it->second.window_id == window_id) {
+    std::vector<std::string> keys;
+    for (const auto &entry : host->webviews) {
+        if (entry.second.window_id == window_id) keys.push_back(entry.first);
+    }
+    for (const std::string &key : keys) {
+        auto found = host->webviews.find(key);
+        if (found == host->webviews.end()) continue;
+        ChildWebView webview = std::move(found->second);
+        host->webviews.erase(found);
 #if NATIVE_SDK_HAS_WEBVIEW2
-            if (it->second.controller) it->second.controller->Close();
+        if (webview.controller) webview.controller->Close();
 #endif
-            if (it->second.hwnd) DestroyWindow(it->second.hwnd);
-            it = host->webviews.erase(it);
-        } else {
-            ++it;
-        }
+        if (webview.hwnd) DestroyWindow(webview.hwnd);
     }
 }
 
@@ -3979,6 +4047,7 @@ static const GUID kNativeSdkIID_WebMessageReceivedHandler = {0x57213f19, 0x00e6,
 static const GUID kNativeSdkIID_AcceleratorKeyPressedHandler = {0xb29c7e28, 0xfa79, 0x41a8, {0x8e, 0x44, 0x65, 0x81, 0x1c, 0x76, 0xdc, 0xb2}};
 static const GUID kNativeSdkIID_WebResourceRequestedHandler = {0xab00b74c, 0x15f1, 0x4646, {0x80, 0xe8, 0xe7, 0x63, 0x41, 0xd2, 0x5d, 0x71}};
 static const GUID kNativeSdkIID_NavigationStartingHandler = {0x9adbe429, 0xf36d, 0x432b, {0x9d, 0xdc, 0xf8, 0x88, 0x1f, 0xbd, 0x76, 0xe3}};
+static const GUID kNativeSdkIID_NavigationCompletedHandler = {0xd33a35bf, 0x1c49, 0x4f98, {0x93, 0xab, 0x00, 0x6e, 0x05, 0x33, 0xfe, 0x1c}};
 
 template <typename Interface> struct WebView2HandlerIid;
 template <> struct WebView2HandlerIid<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler> {
@@ -3998,6 +4067,9 @@ template <> struct WebView2HandlerIid<ICoreWebView2WebResourceRequestedEventHand
 };
 template <> struct WebView2HandlerIid<ICoreWebView2NavigationStartingEventHandler> {
     static const GUID &value() { return kNativeSdkIID_NavigationStartingHandler; }
+};
+template <> struct WebView2HandlerIid<ICoreWebView2NavigationCompletedEventHandler> {
+    static const GUID &value() { return kNativeSdkIID_NavigationCompletedHandler; }
 };
 
 /* Every handler interface above declares a two-argument Invoke; this
@@ -4269,6 +4341,34 @@ static void loadWebViewSource(ChildWebView &webview) {
     webview.webview->Navigate(wide_target.c_str());
 }
 
+static int navigationFailureClass(COREWEBVIEW2_WEB_ERROR_STATUS status) {
+    switch (status) {
+        case COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_COMMON_NAME_IS_INCORRECT:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_EXPIRED:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_CLIENT_CERTIFICATE_CONTAINS_ERRORS:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_REVOKED:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_IS_INVALID:
+            return kWebViewNavigationFailureTls;
+        case COREWEBVIEW2_WEB_ERROR_STATUS_SERVER_UNREACHABLE:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_TIMEOUT:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_ERROR_HTTP_INVALID_SERVER_RESPONSE:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_CONNECTION_ABORTED:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_CONNECTION_RESET:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_DISCONNECTED:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_CANNOT_CONNECT:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_HOST_NAME_NOT_RESOLVED:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_REDIRECT_FAILED:
+            return kWebViewNavigationFailureNetwork;
+        case COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_UNEXPECTED_ERROR:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_VALID_AUTHENTICATION_CREDENTIALS_REQUIRED:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_VALID_PROXY_AUTHENTICATION_REQUIRED:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED:
+            return kWebViewNavigationFailureUnknown;
+    }
+    return kWebViewNavigationFailureUnknown;
+}
+
 static CreateEnvironmentFn webView2Factory() {
     static HMODULE loader = LoadLibraryW(L"WebView2Loader.dll");
     if (!loader) return nullptr;
@@ -4279,9 +4379,10 @@ static void cleanupPendingChildWebView(Host *host, const std::string &key) {
     if (!host) return;
     auto found = host->webviews.find(key);
     if (found == host->webviews.end()) return;
-    if (found->second.controller) found->second.controller->Close();
-    if (found->second.hwnd) DestroyWindow(found->second.hwnd);
+    ChildWebView webview = std::move(found->second);
     host->webviews.erase(found);
+    if (webview.controller) webview.controller->Close();
+    if (webview.hwnd) DestroyWindow(webview.hwnd);
 }
 
 static bool createChildWebView(Host *host, const std::string &key) {
@@ -4416,27 +4517,96 @@ static bool createChildWebView(Host *host, const std::string &key) {
                                 return S_OK;
                             }).Get(), &asset_token);
 
-                        EventRegistrationToken token = {};
+                        EventRegistrationToken navigation_starting_token = {};
                         found->second.webview->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
                             [host, key, lifetime](ICoreWebView2 *, ICoreWebView2NavigationStartingEventArgs *args) -> HRESULT {
                                 auto token = lifetime.lock();
                                 if (!token) return S_OK;
                                 std::lock_guard<std::recursive_mutex> guard(token->mutex);
                                 if (!token->alive) return S_OK;
+                                auto found = host->webviews.find(key);
+                                if (found == host->webviews.end()) return S_OK;
                                 LPWSTR uri_bytes = nullptr;
-                                if (!args || FAILED(args->get_Uri(&uri_bytes))) return S_OK;
+                                if (!args || FAILED(args->get_Uri(&uri_bytes)) || !uri_bytes) {
+                                    if (found->second.label != "main") {
+                                        emitInvalidWebViewNavigation(host, found->second, kWebViewNavigationStarted);
+                                    }
+                                    return S_OK;
+                                }
                                 std::wstring uri_wide = uri_bytes ? std::wstring(uri_bytes) : std::wstring();
                                 if (uri_bytes) CoTaskMemFree(uri_bytes);
                                 std::string uri = narrow(uri_wide);
-                                auto found = host->webviews.find(key);
-                                if (found != host->webviews.end() && isInternalAssetUrl(found->second, uri)) return S_OK;
-                                if (uri.empty() || uri.rfind("about:", 0) == 0 || policyListMatches(host->allowed_origins, uri)) return S_OK;
-                                if (host->external_link_action == 1 && policyListMatches(host->allowed_external_urls, uri)) {
-                                    ShellExecuteW(nullptr, L"open", uri_wide.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                                const bool accepted = isInternalAssetUrl(found->second, uri) ||
+                                    (!uri.empty() && (uri.rfind("about:", 0) == 0 || policyListMatches(host->allowed_origins, uri)));
+                                if (!accepted) {
+                                    if (host->external_link_action == 1 && policyListMatches(host->allowed_external_urls, uri)) {
+                                        ShellExecuteW(nullptr, L"open", uri_wide.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                                    }
+                                    args->put_Cancel(TRUE);
+                                    return S_OK;
                                 }
-                                args->put_Cancel(TRUE);
+
+                                // The reserved renderer is the window's own
+                                // source. It keeps the same policy callback,
+                                // but only explicit child WebViews participate
+                                // in the public navigation lifecycle.
+                                if (found->second.label == "main") return S_OK;
+
+                                BOOL redirected = FALSE;
+                                UINT64 navigation_id = 0;
+                                if (FAILED(args->get_IsRedirected(&redirected)) ||
+                                    FAILED(args->get_NavigationId(&navigation_id)) ||
+                                    navigation_id == 0) {
+                                    emitInvalidWebViewNavigation(host, found->second, kWebViewNavigationStarted);
+                                    return S_OK;
+                                }
+                                emitWebViewNavigation(
+                                    host,
+                                    found->second,
+                                    navigation_id,
+                                    redirected ? kWebViewNavigationRedirected : kWebViewNavigationStarted,
+                                    uri,
+                                    kWebViewNavigationNoFailure);
                                 return S_OK;
-                            }).Get(), &token);
+                            }).Get(), &navigation_starting_token);
+
+                        EventRegistrationToken navigation_completed_token = {};
+                        found->second.webview->add_NavigationCompleted(Callback<ICoreWebView2NavigationCompletedEventHandler>(
+                            [host, key, lifetime](ICoreWebView2 *, ICoreWebView2NavigationCompletedEventArgs *args) -> HRESULT {
+                                auto token = lifetime.lock();
+                                if (!token) return S_OK;
+                                std::lock_guard<std::recursive_mutex> guard(token->mutex);
+                                if (!token->alive) return S_OK;
+                                auto found = host->webviews.find(key);
+                                if (found == host->webviews.end()) return S_OK;
+                                if (found->second.label == "main") return S_OK;
+
+                                BOOL success = FALSE;
+                                UINT64 navigation_id = 0;
+                                if (!args ||
+                                    FAILED(args->get_IsSuccess(&success)) ||
+                                    FAILED(args->get_NavigationId(&navigation_id)) ||
+                                    navigation_id == 0) {
+                                    emitInvalidWebViewNavigation(host, found->second, kWebViewNavigationFinished);
+                                    return S_OK;
+                                }
+                                if (success) {
+                                    emitWebViewNavigation(host, found->second, navigation_id, kWebViewNavigationFinished, std::string(), kWebViewNavigationNoFailure);
+                                    return S_OK;
+                                }
+
+                                COREWEBVIEW2_WEB_ERROR_STATUS status = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
+                                if (FAILED(args->get_WebErrorStatus(&status))) {
+                                    emitInvalidWebViewNavigation(host, found->second, kWebViewNavigationFailed);
+                                    return S_OK;
+                                }
+                                if (status == COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED) {
+                                    emitWebViewNavigation(host, found->second, navigation_id, kWebViewNavigationCancelled, std::string(), kWebViewNavigationNoFailure);
+                                    return S_OK;
+                                }
+                                emitWebViewNavigation(host, found->second, navigation_id, kWebViewNavigationFailed, std::string(), navigationFailureClass(status));
+                                return S_OK;
+                            }).Get(), &navigation_completed_token);
                         loadWebViewSource(found->second);
                     }
                     return S_OK;
@@ -5064,6 +5234,8 @@ void native_sdk_windows_destroy(Host *host) {
      * messages must not emit. */
     host->callback = nullptr;
     host->bridge_callback = nullptr;
+    host->webview_navigation_callback = nullptr;
+    host->webview_navigation_context = nullptr;
     for (size_t index = 0; index < kMaxAppTimers; ++index) {
         AppTimer &slot = host->app_timers[index];
         if (slot.in_use && slot.hwnd) KillTimer(slot.hwnd, kAppTimerIdBase + index);
@@ -5287,6 +5459,12 @@ void native_sdk_windows_set_bridge_callback(Host *host, BridgeCallback callback,
     if (!host) return;
     host->bridge_callback = callback;
     host->bridge_context = context;
+}
+
+void native_sdk_windows_set_webview_navigation_callback(Host *host, WebViewNavigationCallback callback, void *context) {
+    if (!host) return;
+    host->webview_navigation_callback = callback;
+    host->webview_navigation_context = context;
 }
 
 void native_sdk_windows_bridge_respond(Host *host, const char *response, size_t response_len) {
@@ -6389,11 +6567,12 @@ int native_sdk_windows_close_webview(Host *host, uint64_t window_id, const char 
     if (label_string == "main") return 0;
     auto found = host->webviews.find(webViewKey(window_id, label_string));
     if (found == host->webviews.end()) return 0;
-#if NATIVE_SDK_HAS_WEBVIEW2
-    if (found->second.controller) found->second.controller->Close();
-#endif
-    if (found->second.hwnd) DestroyWindow(found->second.hwnd);
+    ChildWebView webview = std::move(found->second);
     host->webviews.erase(found);
+#if NATIVE_SDK_HAS_WEBVIEW2
+    if (webview.controller) webview.controller->Close();
+#endif
+    if (webview.hwnd) DestroyWindow(webview.hwnd);
     return 1;
 }
 

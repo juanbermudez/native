@@ -79,6 +79,11 @@ pub const WebEngine = enum {
 pub const PlatformFeature = enum {
     main_webview,
     child_webviews,
+    /// Correlated top-level child-WebView navigation lifecycle events.
+    /// System engines on macOS, Windows, and Linux implement this; CEF
+    /// hosts deliberately report false until they can preserve identity
+    /// and terminal-event guarantees across replacement and teardown.
+    webview_navigation_events,
     native_views,
     native_control_commands,
     menus,
@@ -1844,6 +1849,29 @@ pub const Appearance = struct {
     high_contrast: bool = false,
 };
 
+pub const WebViewNavigationPhase = enum(u8) {
+    started,
+    redirected,
+    finished,
+    failed,
+    cancelled,
+};
+
+pub const WebViewNavigationFailureClass = enum(u8) {
+    network,
+    tls,
+    unknown,
+};
+
+pub const WebViewNavigationEvent = struct {
+    window_id: WindowId,
+    label: []const u8,
+    navigation_id: u64,
+    phase: WebViewNavigationPhase,
+    url: []const u8,
+    failure_class: ?WebViewNavigationFailureClass = null,
+};
+
 pub const Event = union(enum) {
     app_start,
     app_activated,
@@ -1875,6 +1903,7 @@ pub const Event = union(enum) {
     /// Audio player reports: load acknowledgment, coarse position ticks
     /// while playing, one completion at natural end, async failures.
     audio: AudioEvent,
+    webview_navigation: WebViewNavigationEvent,
 
     pub fn name(self: Event) []const u8 {
         return switch (self) {
@@ -1902,6 +1931,7 @@ pub const Event = union(enum) {
             .context_menu_action => "context_menu_action",
             .widget_accessibility_action => "widget_accessibility_action",
             .audio => "audio",
+            .webview_navigation => "webview_navigation",
         };
     }
 };
@@ -2640,6 +2670,10 @@ fn defaultSupportsFeature(services: PlatformServices, feature: PlatformFeature) 
     return switch (feature) {
         .main_webview => services.load_window_webview_fn != null or services.load_webview_fn != null,
         .child_webviews => services.create_webview_fn != null,
+        // Navigation events arrive from a host callback rather than a
+        // PlatformServices verb, so the generic services probe cannot
+        // infer support honestly.
+        .webview_navigation_events => false,
         .native_views => services.create_view_fn != null,
         .native_control_commands => services.create_view_fn != null,
         .menus => services.configure_menus_fn != null,

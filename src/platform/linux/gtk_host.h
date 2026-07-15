@@ -93,6 +93,7 @@ typedef struct {
 
 typedef void (*native_sdk_gtk_event_callback_t)(void *context, const native_sdk_gtk_event_t *event);
 typedef void (*native_sdk_gtk_bridge_callback_t)(void *context, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *message, size_t message_len, const char *origin, size_t origin_len);
+typedef void (*native_sdk_gtk_webview_navigation_callback_t)(void *context, uint64_t window_id, const char *webview_label, size_t webview_label_len, uint64_t engine_id, int phase, const char *url, size_t url_len, int failure_class);
 
 typedef struct {
     const char *title;
@@ -164,6 +165,7 @@ int native_sdk_gtk_decode_image(const uint8_t *bytes, size_t bytes_len, uint8_t 
 void native_sdk_gtk_load_webview(native_sdk_gtk_host_t *host, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback);
 void native_sdk_gtk_load_window_webview(native_sdk_gtk_host_t *host, uint64_t window_id, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback);
 void native_sdk_gtk_set_bridge_callback(native_sdk_gtk_host_t *host, native_sdk_gtk_bridge_callback_t callback, void *context);
+void native_sdk_gtk_set_webview_navigation_callback(native_sdk_gtk_host_t *host, native_sdk_gtk_webview_navigation_callback_t callback, void *context);
 void native_sdk_gtk_bridge_respond(native_sdk_gtk_host_t *host, const char *response, size_t response_len);
 void native_sdk_gtk_bridge_respond_window(native_sdk_gtk_host_t *host, uint64_t window_id, const char *response, size_t response_len);
 void native_sdk_gtk_bridge_respond_webview(native_sdk_gtk_host_t *host, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *response, size_t response_len);

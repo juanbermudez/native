@@ -302,6 +302,7 @@ typedef struct {
 
 typedef void (*native_sdk_appkit_event_callback_t)(void *context, const native_sdk_appkit_event_t *event);
 typedef void (*native_sdk_appkit_bridge_callback_t)(void *context, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *message, size_t message_len, const char *origin, size_t origin_len);
+typedef void (*native_sdk_appkit_webview_navigation_callback_t)(void *context, uint64_t window_id, const char *webview_label, size_t webview_label_len, uint64_t engine_id, int phase, const char *url, size_t url_len, int failure_class);
 
 // show_policy 0 = immediate (ordered front at create), 1 = deferred to
 // the first canvas present (present-before-show: the window is created
@@ -335,6 +336,7 @@ void native_sdk_appkit_stop(native_sdk_appkit_host_t *host);
 void native_sdk_appkit_load_webview(native_sdk_appkit_host_t *host, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback);
 void native_sdk_appkit_load_window_webview(native_sdk_appkit_host_t *host, uint64_t window_id, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback);
 void native_sdk_appkit_set_bridge_callback(native_sdk_appkit_host_t *host, native_sdk_appkit_bridge_callback_t callback, void *context);
+void native_sdk_appkit_set_webview_navigation_callback(native_sdk_appkit_host_t *host, native_sdk_appkit_webview_navigation_callback_t callback, void *context);
 void native_sdk_appkit_bridge_respond(native_sdk_appkit_host_t *host, const char *response, size_t response_len);
 void native_sdk_appkit_bridge_respond_window(native_sdk_appkit_host_t *host, uint64_t window_id, const char *response, size_t response_len);
 void native_sdk_appkit_bridge_respond_webview(native_sdk_appkit_host_t *host, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *response, size_t response_len);

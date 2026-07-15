@@ -129,6 +129,68 @@ test "runtime dispatches app activation lifecycle events" {
     try std.testing.expectEqual(LifecycleEvent.deactivate, app_state.events[3]);
 }
 
+test "runtime journals and emits the typed WebView navigation contract with a compatibility alias" {
+    const TestApp = struct {
+        navigation_count: usize = 0,
+        last_navigation_id: u64 = 0,
+        last_phase: platform.WebViewNavigationPhase = .started,
+
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "webview-navigation", .source = platform.WebViewSource.html("<h1>Navigation</h1>"), .event_fn = event };
+        }
+
+        fn event(context: *anyopaque, runtime: *Runtime, event_value: Event) anyerror!void {
+            _ = runtime;
+            const self: *@This() = @ptrCast(@alignCast(context));
+            switch (event_value) {
+                .webview_navigation => |navigation| {
+                    self.navigation_count += 1;
+                    self.last_navigation_id = navigation.navigation_id;
+                    self.last_phase = navigation.phase;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const harness = try TestHarness().create(std.testing.allocator, .{});
+    defer harness.destroy(std.testing.allocator);
+    var app_state: TestApp = .{};
+    const app = app_state.app();
+    try harness.start(app);
+
+    const before_failed = harness.null_platform.windowEventCount();
+    try harness.runtime.dispatchPlatformEvent(app, .{ .webview_navigation = .{
+        .window_id = 1,
+        .label = "page-tab-1",
+        .navigation_id = std.math.maxInt(u64),
+        .phase = .failed,
+        .url = "https://example.com/final",
+        .failure_class = .tls,
+    } });
+    try std.testing.expectEqual(before_failed + 1, harness.null_platform.windowEventCount());
+    try std.testing.expectEqualStrings("webview:navigation", harness.null_platform.lastWindowEventName());
+    const failed_detail = harness.null_platform.lastWindowEventDetail();
+    try std.testing.expect(std.mem.indexOf(u8, failed_detail, "\"navigationId\":\"18446744073709551615\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_detail, "\"phase\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_detail, "\"failureClass\":\"tls\"") != null);
+
+    const before_started = harness.null_platform.windowEventCount();
+    try harness.runtime.dispatchPlatformEvent(app, .{ .webview_navigation = .{
+        .window_id = 1,
+        .label = "page-tab-1",
+        .navigation_id = 8,
+        .phase = .started,
+        .url = "https://example.com/start",
+    } });
+    try std.testing.expectEqual(before_started + 2, harness.null_platform.windowEventCount());
+    try std.testing.expectEqualStrings("webview:navigate", harness.null_platform.lastWindowEventName());
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastWindowEventDetail(), "\"navigationId\"") == null);
+    try std.testing.expectEqual(@as(usize, 2), app_state.navigation_count);
+    try std.testing.expectEqual(@as(u64, 8), app_state.last_navigation_id);
+    try std.testing.expectEqual(platform.WebViewNavigationPhase.started, app_state.last_phase);
+}
+
 test "runtime stores and dispatches appearance preferences" {
     const TestApp = struct {
         appearance_count: u32 = 0,

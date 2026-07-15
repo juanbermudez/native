@@ -122,6 +122,17 @@ typedef struct native_sdk_gtk_webview {
     int transparent;
     int bridge_enabled;
     WebKitUserContentManager *content_manager;
+    /* WebKitGTK does not expose a navigation object on load signals, so
+     * child main-frame loads use one wrap-safe generation per STARTED.
+     * The record is copied during array compaction; signal handlers always
+     * resolve it again from WebKitWebView* and never retain this address. */
+    uint64_t navigation_generation;
+    uint64_t active_navigation_generation;
+    uint64_t tls_navigation_generation;
+    /* load-failed is always followed by load-changed(FINISHED). Count the
+     * synthetic tails so reentrant navigation from the failure callback
+     * cannot let an old FINISHED terminate the new generation. */
+    unsigned int failed_finished_pending;
 } native_sdk_gtk_webview_t;
 
 typedef struct native_sdk_gtk_native_view {
@@ -318,6 +329,8 @@ struct native_sdk_gtk_host {
     void *callback_context;
     native_sdk_gtk_bridge_callback_t bridge_callback;
     void *bridge_context;
+    native_sdk_gtk_webview_navigation_callback_t webview_navigation_callback;
+    void *webview_navigation_context;
 
     native_sdk_gtk_window_t windows[NATIVE_SDK_MAX_WINDOWS];
     int window_count;
@@ -491,6 +504,20 @@ static native_sdk_gtk_window_t *native_sdk_window_for_web_view(native_sdk_gtk_ho
         if (win->web_view == web_view) return win;
         for (int j = 0; j < win->webview_count; j++) {
             if (win->webviews[j].web_view == web_view) return win;
+        }
+    }
+    return NULL;
+}
+
+static native_sdk_gtk_webview_t *native_sdk_child_webview_for_web_view(native_sdk_gtk_host_t *host, WebKitWebView *web_view, native_sdk_gtk_window_t **out_window) {
+    if (out_window) *out_window = NULL;
+    if (!host || !web_view) return NULL;
+    for (int i = 0; i < host->window_count; i++) {
+        native_sdk_gtk_window_t *win = &host->windows[i];
+        for (int j = 0; j < win->webview_count; j++) {
+            if (win->webviews[j].web_view != web_view) continue;
+            if (out_window) *out_window = win;
+            return &win->webviews[j];
         }
     }
     return NULL;
@@ -2507,6 +2534,145 @@ static gboolean on_webview_decide_policy(WebKitWebView *web_view, WebKitPolicyDe
     return TRUE;
 }
 
+/* Child WebViews only: the window's lazy main WebView remains outside the
+ * public child lifecycle contract. WebKitGTK load signals are main-frame
+ * signals, so iframe and subresource activity cannot enter this adapter. */
+static void native_sdk_emit_child_webview_navigation(
+    native_sdk_gtk_host_t *host,
+    uint64_t window_id,
+    const char *label,
+    uint64_t engine_id,
+    int phase,
+    const char *url,
+    int failure_class)
+{
+    if (!host || !host->webview_navigation_callback || !label || !label[0] || engine_id == 0) return;
+    const char *resolved_url = url ? url : "";
+    if ((phase == 0 || phase == 1) && !resolved_url[0]) return;
+
+    /* The callback is synchronous and may close this child/window, compacting
+     * the arrays and freeing label. Own every byte and callback field it uses
+     * before crossing into Zig. */
+    char *label_snapshot = g_strdup(label);
+    char *url_snapshot = g_strdup(resolved_url);
+    native_sdk_gtk_webview_navigation_callback_t callback = host->webview_navigation_callback;
+    void *context = host->webview_navigation_context;
+    if (!label_snapshot || !url_snapshot) {
+        g_free(label_snapshot);
+        g_free(url_snapshot);
+        return;
+    }
+    callback(
+        context,
+        window_id,
+        label_snapshot,
+        strlen(label_snapshot),
+        engine_id,
+        phase,
+        url_snapshot,
+        strlen(url_snapshot),
+        failure_class);
+    g_free(label_snapshot);
+    g_free(url_snapshot);
+}
+
+static int native_sdk_webview_load_cancelled(const GError *error) {
+    if (!error) return 0;
+    return g_error_matches(error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED) ||
+           g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+}
+
+static int native_sdk_webview_failure_class(const native_sdk_gtk_webview_t *webview, uint64_t engine_id, const GError *error) {
+    if ((webview && webview->tls_navigation_generation == engine_id) ||
+        (error && error->domain == G_TLS_ERROR)) return 1;
+    if (error && (error->domain == WEBKIT_NETWORK_ERROR ||
+                  error->domain == G_IO_ERROR ||
+                  error->domain == G_RESOLVER_ERROR)) return 0;
+    return 2;
+}
+
+static void on_child_webview_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event, gpointer data) {
+    native_sdk_gtk_host_t *host = data;
+    native_sdk_gtk_window_t *win = NULL;
+    native_sdk_gtk_webview_t *webview = native_sdk_child_webview_for_web_view(host, web_view, &win);
+    if (!webview || !win || !webview->label) return;
+
+    const char *url = webkit_web_view_get_uri(web_view);
+    if (load_event == WEBKIT_LOAD_STARTED) {
+        webview->navigation_generation += 1;
+        if (webview->navigation_generation == 0) webview->navigation_generation = 1;
+        const uint64_t engine_id = webview->navigation_generation;
+        webview->active_navigation_generation = engine_id;
+        webview->tls_navigation_generation = 0;
+        native_sdk_emit_child_webview_navigation(host, win->id, webview->label, engine_id, 0, url, -1);
+        return;
+    }
+    if (load_event == WEBKIT_LOAD_REDIRECTED) {
+        const uint64_t engine_id = webview->active_navigation_generation;
+        if (engine_id == 0) return;
+        native_sdk_emit_child_webview_navigation(host, win->id, webview->label, engine_id, 1, url, -1);
+        return;
+    }
+    if (load_event != WEBKIT_LOAD_FINISHED) return;
+
+    /* WebKitGTK emits FINISHED after load-failed. Consume that mandatory
+     * tail without touching a navigation that a reentrant failure handler
+     * may already have started. */
+    if (webview->failed_finished_pending > 0) {
+        webview->failed_finished_pending -= 1;
+        return;
+    }
+    const uint64_t engine_id = webview->active_navigation_generation;
+    if (engine_id == 0) return;
+    webview->active_navigation_generation = 0;
+    webview->tls_navigation_generation = 0;
+    native_sdk_emit_child_webview_navigation(host, win->id, webview->label, engine_id, 2, url, -1);
+}
+
+static gboolean on_child_webview_load_failed(WebKitWebView *web_view, WebKitLoadEvent load_event, const char *failing_uri, GError *error, gpointer data) {
+    (void)load_event;
+    native_sdk_gtk_host_t *host = data;
+    native_sdk_gtk_window_t *win = NULL;
+    native_sdk_gtk_webview_t *webview = native_sdk_child_webview_for_web_view(host, web_view, &win);
+    if (!webview || !win || !webview->label) return FALSE;
+    const uint64_t engine_id = webview->active_navigation_generation;
+    if (engine_id == 0) return FALSE;
+
+    const int cancelled = native_sdk_webview_load_cancelled(error);
+    const int failure_class = cancelled ? -1 : native_sdk_webview_failure_class(webview, engine_id, error);
+    if (webview->failed_finished_pending < UINT_MAX) webview->failed_finished_pending += 1;
+    webview->active_navigation_generation = 0;
+    webview->tls_navigation_generation = 0;
+    native_sdk_emit_child_webview_navigation(
+        host,
+        win->id,
+        webview->label,
+        engine_id,
+        cancelled ? 4 : 3,
+        failing_uri ? failing_uri : webkit_web_view_get_uri(web_view),
+        failure_class);
+    /* We emitted the terminal and trusted chrome owns the failure UI. Stop
+     * WebKit's default error-page handler: on WebKitGTK 6 it can begin a
+     * synthetic same-URI load after this callback, which would otherwise be
+     * exposed as a false replacement navigation. FINISHED still follows the
+     * failed load and is consumed by failed_finished_pending above. */
+    return TRUE;
+}
+
+static gboolean on_child_webview_load_failed_with_tls_errors(WebKitWebView *web_view, const char *failing_uri, GTlsCertificate *certificate, GTlsCertificateFlags errors, gpointer data) {
+    (void)failing_uri;
+    (void)certificate;
+    (void)errors;
+    native_sdk_gtk_host_t *host = data;
+    native_sdk_gtk_webview_t *webview = native_sdk_child_webview_for_web_view(host, web_view, NULL);
+    if (webview && webview->active_navigation_generation != 0) {
+        webview->tls_navigation_generation = webview->active_navigation_generation;
+    }
+    /* Keep WebKit's default TLS failure path. Its subsequent load-failed
+     * callback consumes the marker and emits the one typed terminal. */
+    return FALSE;
+}
+
 static void on_bridge_message(WebKitUserContentManager *manager, JSCValue *js_result, gpointer data) {
     native_sdk_gtk_window_t *win = data;
     native_sdk_gtk_host_t *host = win->host;
@@ -3012,6 +3178,11 @@ void native_sdk_gtk_load_window_webview(native_sdk_gtk_host_t *host, uint64_t wi
 void native_sdk_gtk_set_bridge_callback(native_sdk_gtk_host_t *host, native_sdk_gtk_bridge_callback_t callback, void *context) {
     host->bridge_callback = callback;
     host->bridge_context = context;
+}
+
+void native_sdk_gtk_set_webview_navigation_callback(native_sdk_gtk_host_t *host, native_sdk_gtk_webview_navigation_callback_t callback, void *context) {
+    host->webview_navigation_callback = callback;
+    host->webview_navigation_context = context;
 }
 
 void native_sdk_gtk_bridge_respond(native_sdk_gtk_host_t *host, const char *response, size_t response_len) {
@@ -3787,6 +3958,9 @@ int native_sdk_gtk_create_webview(native_sdk_gtk_host_t *host, uint64_t window_i
     }
     native_sdk_reorder_overlays(win);
     g_signal_connect(web_view, "decide-policy", G_CALLBACK(on_webview_decide_policy), win);
+    g_signal_connect(web_view, "load-changed", G_CALLBACK(on_child_webview_load_changed), host);
+    g_signal_connect(web_view, "load-failed", G_CALLBACK(on_child_webview_load_failed), host);
+    g_signal_connect(web_view, "load-failed-with-tls-errors", G_CALLBACK(on_child_webview_load_failed_with_tls_errors), host);
     webkit_web_view_load_uri(web_view, url_copy);
     free(url_copy);
     return 1;

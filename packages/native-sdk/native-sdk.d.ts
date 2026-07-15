@@ -394,6 +394,8 @@ export type NativeSdkPlatformFeature =
   | "mainWebView"
   | "child_webviews"
   | "childWebViews"
+  | "webview_navigation_events"
+  | "webviewNavigationEvents"
   | "native_views"
   | "nativeViews"
   | "native_control_commands"
@@ -419,7 +421,19 @@ export type NativeSdkPlatformFeature =
   | "app_activation_events"
   | "appActivationEvents"
   | "gpu_surfaces"
-  | "gpuSurfaces";
+  | "gpuSurfaces"
+  | "gpu_surface_scroll_drivers"
+  | "gpuSurfaceScrollDrivers"
+  | "context_menus"
+  | "contextMenus"
+  | "view_surface_adoption"
+  | "viewSurfaceAdoption"
+  | "audio_playback"
+  | "audioPlayback"
+  | "audio_streaming"
+  | "audioStreaming"
+  | "audio_spectrum"
+  | "audioSpectrum";
 
 export type NativeSdkPlatformFeatureSelector =
   | { feature: NativeSdkPlatformFeature; name?: never }
@@ -468,6 +482,32 @@ export type NativeSdkAppLifecycleDetail = Record<string, never>;
 export interface NativeSdkFileDropDetail {
   windowId: number;
   paths: string[];
+}
+
+export type NativeSdkWebViewNavigationPhase =
+  | "started"
+  | "redirected"
+  | "finished"
+  | "failed"
+  | "cancelled";
+
+export type NativeSdkWebViewNavigationFailureClass = "network" | "tls" | "unknown";
+
+export interface NativeSdkWebViewNavigationDetail {
+  windowId: number;
+  label: string;
+  /** Opaque unsigned 64-bit identity serialized as a string for lossless JavaScript transport. */
+  navigationId: string;
+  phase: NativeSdkWebViewNavigationPhase;
+  url: string;
+  /** Present only when `phase` is `failed`. */
+  failureClass?: NativeSdkWebViewNavigationFailureClass;
+}
+
+export interface NativeSdkWebViewNavigateDetail {
+  windowId: number;
+  label: string;
+  url: string;
 }
 
 export interface NativeSdkOpenFileOptions {
@@ -539,10 +579,14 @@ export interface NativeSdkApi {
   on(name: "shortcut", callback: (detail: NativeSdkShortcutDetail) => void): () => void;
   on(name: "app:activate" | "app:deactivate", callback: (detail: NativeSdkAppLifecycleDetail) => void): () => void;
   on(name: "drop:files", callback: (detail: NativeSdkFileDropDetail) => void): () => void;
+  on(name: "webview:navigation", callback: (detail: NativeSdkWebViewNavigationDetail) => void): () => void;
+  on(name: "webview:navigate", callback: (detail: NativeSdkWebViewNavigateDetail) => void): () => void;
   on<T = NativeSdkJson>(name: string, callback: (detail: T) => void): () => void;
   off(name: "shortcut", callback: (detail: NativeSdkShortcutDetail) => void): void;
   off(name: "app:activate" | "app:deactivate", callback: (detail: NativeSdkAppLifecycleDetail) => void): void;
   off(name: "drop:files", callback: (detail: NativeSdkFileDropDetail) => void): void;
+  off(name: "webview:navigation", callback: (detail: NativeSdkWebViewNavigationDetail) => void): void;
+  off(name: "webview:navigate", callback: (detail: NativeSdkWebViewNavigateDetail) => void): void;
   off<T = NativeSdkJson>(name: string, callback: (detail: T) => void): void;
   /** Dispatch an app command through the runtime command path. */
   commands: {
