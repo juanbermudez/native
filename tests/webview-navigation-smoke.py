@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -24,10 +25,10 @@ CACHE = APP_DIR / ".zig-cache"
 AUTOMATION = CACHE / "native-sdk-automation"
 LOG_PATH = CACHE / "native-sdk-webview-navigation-smoke.log"
 FIXTURE_LOG_PATH = CACHE / "native-sdk-webview-navigation-fixture.log"
-PORT_PATH = CACHE / "native-sdk-webview-navigation-port"
+METADATA_PATH = CACHE / "native-sdk-webview-navigation-metadata.json"
 FIXTURE = ROOT / "tests" / "fixtures" / "webview_navigation_server.py"
+CERTIFICATE = ROOT / "tests" / "fixtures" / "webview_navigation_cert.pem"
 DIST = APP_DIR / "dist"
-PORT = 48765
 ASSET_URL = "zero://app/docs/My%20File%23%25.html"
 PRIVATE_ORIGIN = "native-sdk-app.localhost"
 TERMINALS = {"finished", "failed", "cancelled"}
@@ -58,6 +59,50 @@ class Record:
     offset: int
     line: str
     event: Event | None
+
+
+@dataclass(frozen=True)
+class FixtureMetadata:
+    http_origin: str
+    https_origin: str
+    certificate_sha256: str
+
+
+def fixture_certificate_fingerprint() -> str:
+    try:
+        der = ssl.PEM_cert_to_DER_cert(CERTIFICATE.read_text(encoding="ascii"))
+    except (OSError, ValueError) as error:
+        raise Failure(f"invalid fixture certificate: {error}") from error
+    import hashlib
+    return hashlib.sha256(der).hexdigest()
+
+
+def parse_fixture_metadata(text: str, expected_fingerprint: str) -> FixtureMetadata:
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise Failure(f"fixture metadata is not valid JSON: {error}") from error
+    check(isinstance(value, dict), "fixture metadata must be an object")
+    expected_keys = {"version", "http_origin", "https_origin", "certificate_sha256"}
+    check(set(value) == expected_keys, f"fixture metadata keys differ: {sorted(value)}")
+    check(type(value["version"]) is int and value["version"] == 1, "fixture metadata version must be integer 1")
+    origin_pattern = re.compile(r"^(http|https)://127\.0\.0\.1:([1-9][0-9]{0,4})$")
+    origins: dict[str, str] = {}
+    ports: dict[str, int] = {}
+    for name, scheme in (("http_origin", "http"), ("https_origin", "https")):
+        origin = value[name]
+        check(isinstance(origin, str), f"fixture {name} must be a string")
+        match = origin_pattern.fullmatch(origin)
+        check(match is not None and match.group(1) == scheme, f"fixture {name} is not an exact loopback {scheme} origin")
+        port = int(match.group(2))
+        check(port <= 65535, f"fixture {name} port is out of range")
+        origins[name], ports[name] = origin, port
+    check(ports["http_origin"] != ports["https_origin"], "fixture HTTP and HTTPS ports must differ")
+    fingerprint = value["certificate_sha256"]
+    check(isinstance(fingerprint, str) and re.fullmatch(r"[0-9a-f]{64}", fingerprint) is not None,
+          "fixture certificate fingerprint must be lowercase SHA256 hex")
+    check(fingerprint == expected_fingerprint, "fixture certificate fingerprint does not match committed certificate")
+    return FixtureMetadata(origins["http_origin"], origins["https_origin"], fingerprint)
 
 
 def parse_event(line: str) -> Event | None:
@@ -154,6 +199,8 @@ class Smoke:
         self.fixture_process: subprocess.Popen[bytes] | None = None
         self.log_stream: BinaryIO | None = None
         self.fixture_log_stream: BinaryIO | None = None
+        self.fixture: FixtureMetadata | None = None
+        self.tls_navigation_id: int | None = None
 
     def run(self) -> None:
         check(self.app.is_file(), f"WebView app does not exist: {self.app}")
@@ -163,7 +210,7 @@ class Smoke:
         for path in list(AUTOMATION.glob("command-*.txt")) + [
             AUTOMATION / "bridge-response.txt", AUTOMATION / "snapshot.txt",
             AUTOMATION / "windows.txt", AUTOMATION / "accessibility.txt",
-            PORT_PATH, LOG_PATH, FIXTURE_LOG_PATH,
+            METADATA_PATH, LOG_PATH, FIXTURE_LOG_PATH,
         ]:
             path.unlink(missing_ok=True)
         with staged_assets():
@@ -186,20 +233,23 @@ class Smoke:
     def start_processes(self) -> None:
         self.fixture_log_stream = FIXTURE_LOG_PATH.open("wb")
         self.fixture_process = subprocess.Popen(
-            [sys.executable, str(FIXTURE), str(PORT_PATH)], cwd=ROOT,
+            [sys.executable, str(FIXTURE), str(METADATA_PATH)], cwd=ROOT,
             stdout=subprocess.DEVNULL, stderr=self.fixture_log_stream, **self.popen_options())
         deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and (not PORT_PATH.is_file() or PORT_PATH.stat().st_size == 0):
+        while time.monotonic() < deadline and (not METADATA_PATH.is_file() or METADATA_PATH.stat().st_size == 0):
             if self.fixture_process.poll() is not None:
                 raise Failure(self.fixture_diagnostic("navigation fixture exited before publishing its port"))
             time.sleep(0.1)
-        if not PORT_PATH.is_file() or PORT_PATH.stat().st_size == 0:
+        if not METADATA_PATH.is_file() or METADATA_PATH.stat().st_size == 0:
             raise Failure(self.fixture_diagnostic("navigation fixture did not start"))
-        check(PORT_PATH.read_text(encoding="utf-8").strip() == str(PORT), "fixture published the wrong port")
+        self.fixture = parse_fixture_metadata(
+            METADATA_PATH.read_text(encoding="utf-8"), fixture_certificate_fingerprint())
 
         env = os.environ.copy()
         env.pop("NATIVE_SDK_FRONTEND_URL", None)
         env["NATIVE_SDK_FRONTEND_ASSETS"] = "1"
+        env["NATIVE_SDK_NAVIGATION_HTTP_ORIGIN"] = self.fixture.http_origin
+        env["NATIVE_SDK_NAVIGATION_HTTPS_ORIGIN"] = self.fixture.https_origin
         self.log_stream = LOG_PATH.open("wb")
         self.app_process = subprocess.Popen(
             [str(self.app)], cwd=APP_DIR, env=env, stdout=self.log_stream,
@@ -314,7 +364,8 @@ class Smoke:
         raise Failure("could not claim an exclusive queue entry for parent close")
 
     def matrix(self) -> None:
-        base = f"http://127.0.0.1:{PORT}"
+        check(self.fixture is not None, "fixture metadata was not loaded")
+        base = self.fixture.http_origin
         ready = self.cli_run("wait")
         check("ready=true" in ready and "dispatch_errors=0" in ready, f"automation was not healthy: {ready!r}")
         self.wait(0, lambda record: 'name="webview.load"' in record.line, "the main WebView load")
@@ -365,13 +416,25 @@ class Smoke:
         time.sleep(4)
         self.one_terminal(same_a_id); self.one_terminal(same_b_id)
 
+        tls_url = f"{self.fixture.https_origin}/tls"
+        cursor, tls_started = self.navigate("tls", tls_url)
+        tls_id = tls_started.event.navigation_id  # type: ignore[union-attr]
+        self.tls_navigation_id = tls_id
+        self.event(cursor, navigation_id=tls_id, phase="failed", url=tls_url, failure_class="tls")
+        time.sleep(0.5)
+        self.one_terminal(tls_id)
+        check(all(record.event is None or record.event.navigation_id != tls_id or record.event.phase != "finished"
+                  for record in self.log.events(cursor)), "TLS navigation emitted finished after failed")
+
         disconnect = f"{base}/disconnect"
         cursor, offline = self.navigate("disconnect", disconnect)
         offline_id = offline.event.navigation_id  # type: ignore[union-attr]
         self.event(cursor, navigation_id=offline_id, phase="failed", failure_class="network")
         self.one_terminal(offline_id)
 
-        blocked = "http://127.0.0.1:48766/policy-blocked"
+        used_ports = {int(base.rsplit(":", 1)[1]), int(self.fixture.https_origin.rsplit(":", 1)[1])}
+        blocked_port = next(port for port in range(1, 65536) if port not in used_ports)
+        blocked = f"http://127.0.0.1:{blocked_port}/policy-blocked"
         cursor, _ = self.operation("blocked", "native-sdk.webview.navigate",
                                    {"label": "smoke", "url": blocked}, False)
         time.sleep(0.5)
@@ -408,6 +471,10 @@ class Smoke:
     def final_health(self) -> None:
         self.app_alive()
         text = self.log.text()
+        check(self.tls_navigation_id is not None, "TLS matrix case did not run")
+        self.one_terminal(self.tls_navigation_id)
+        check(all(record.event is None or record.event.navigation_id != self.tls_navigation_id or record.event.phase != "finished"
+                  for record in self.log.events()), "TLS navigation eventually emitted finished")
         check(all(record.event.label != "main" for record in self.log.events() if record.event),
               'reserved label "main" emitted lifecycle')
         check(PRIVATE_ORIGIN not in text, "private WebView2 asset origin leaked into the public log")
@@ -437,6 +504,37 @@ def self_test() -> None:
         check(records[0].offset < records[1].offset < records[2].offset, "event order parse failed")
         check(log.terminal_count(40) == log.terminal_count(41) == 1, "terminal count failed")
         check(records[1].event is not None and records[1].event.url == ASSET_URL, "encoded URL changed")
+
+    fingerprint = "a" * 64
+    valid = {
+        "version": 1,
+        "http_origin": "http://127.0.0.1:49152",
+        "https_origin": "https://127.0.0.1:49153",
+        "certificate_sha256": fingerprint,
+    }
+    parsed = parse_fixture_metadata(json.dumps(valid), fingerprint)
+    check(parsed.http_origin == valid["http_origin"] and parsed.https_origin == valid["https_origin"],
+          "valid fixture metadata changed")
+    invalid_values = [
+        "not json",
+        "[]",
+        json.dumps({**valid, "extra": True}),
+        json.dumps({**valid, "version": True}),
+        json.dumps({**valid, "version": 2}),
+        json.dumps({**valid, "http_origin": "http://localhost:49152"}),
+        json.dumps({**valid, "http_origin": "http://127.0.0.1:0"}),
+        json.dumps({**valid, "http_origin": "http://127.0.0.1:49152/path"}),
+        json.dumps({**valid, "https_origin": "http://127.0.0.1:49153"}),
+        json.dumps({**valid, "https_origin": "https://127.0.0.1:49152"}),
+        json.dumps({**valid, "certificate_sha256": "A" * 64}),
+        json.dumps(valid),
+    ]
+    for index, value in enumerate(invalid_values):
+        try:
+            parse_fixture_metadata(value, "b" * 64 if index == len(invalid_values) - 1 else fingerprint)
+        except Failure:
+            continue
+        raise Failure(f"invalid fixture metadata case {index} was accepted")
     print("webview navigation smoke self-test ok")
 
 

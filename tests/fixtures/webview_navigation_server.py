@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
-import sys
-import time
+from __future__ import annotations
+
+import hashlib
+import json
+import os
 import socket
+import ssl
+import sys
+import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+FIXTURE_DIR = Path(__file__).resolve().parent
+CERTIFICATE = FIXTURE_DIR / "webview_navigation_cert.pem"
+PRIVATE_KEY = FIXTURE_DIR / "webview_navigation_key.pem"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -37,14 +50,68 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             self.wfile.write(body)
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionResetError):
             pass
 
     def log_message(self, _format, *_args):
         pass
 
 
-server = ThreadingHTTPServer(("127.0.0.1", 48765), Handler)
-with open(sys.argv[1], "w", encoding="utf-8") as port_file:
-    port_file.write(str(server.server_port))
-server.serve_forever()
+def certificate_fingerprint() -> str:
+    pem = CERTIFICATE.read_text(encoding="ascii")
+    der = ssl.PEM_cert_to_DER_cert(pem)
+    return hashlib.sha256(der).hexdigest()
+
+
+def publish_metadata(path: Path, http_port: int, https_port: int) -> None:
+    if not (1 <= http_port <= 65535 and 1 <= https_port <= 65535 and http_port != https_port):
+        raise RuntimeError("fixture servers did not bind distinct valid ports")
+    fingerprint = certificate_fingerprint()
+    if len(fingerprint) != 64 or any(byte not in "0123456789abcdef" for byte in fingerprint):
+        raise RuntimeError("fixture certificate did not produce a SHA256 fingerprint")
+    metadata = {
+        "version": 1,
+        "http_origin": f"http://127.0.0.1:{http_port}",
+        "https_origin": f"https://127.0.0.1:{https_port}",
+        "certificate_sha256": fingerprint,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(metadata, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: webview_navigation_server.py METADATA_PATH")
+    metadata_path = Path(sys.argv[1]).resolve()
+    http_server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    https_server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(CERTIFICATE, PRIVATE_KEY)
+    https_server.socket = context.wrap_socket(https_server.socket, server_side=True)
+    publish_metadata(metadata_path, http_server.server_port, https_server.server_port)
+
+    https_thread = threading.Thread(target=https_server.serve_forever, name="navigation-https", daemon=True)
+    https_thread.start()
+    try:
+        http_server.serve_forever()
+    finally:
+        http_server.server_close()
+        https_server.shutdown()
+        https_server.server_close()
+        https_thread.join(timeout=5)
+
+
+if __name__ == "__main__":
+    main()

@@ -1205,10 +1205,10 @@ pub fn build(b: *std.Build) void {
     webview_cef_link_step.dependOn(&build_webview_cef.step);
 
     const webview_smoke_step = b.step("test-webview-smoke", "Run system WebView automation smoke test");
-    const webview_smoke_build = b.addSystemCommand(&.{ "zig", "build", b.fmt("-Dplatform={s}", .{platform_arg}), "-Dweb-engine=system", "-Dautomation=true", "-Djs-bridge=true" });
+    const webview_smoke_build = b.addSystemCommand(&.{ "zig", "build", b.fmt("-Dplatform={s}", .{platform_arg}), "-Dweb-engine=system", "-Dautomation=true", "-Djs-bridge=true", "-Dnavigation-smoke=true" });
     webview_smoke_build.setCwd(b.path("examples/webview"));
     const python_exe = if (b.graph.host.result.os.tag == .windows) "python" else "python3";
-    const webview_exe_name = if (b.graph.host.result.os.tag == .windows) "webview.exe" else "webview";
+    const webview_exe_name = if (b.graph.host.result.os.tag == .windows) "webview-navigation-smoke.exe" else "webview-navigation-smoke";
     const webview_smoke_run = b.addSystemCommand(&.{ python_exe, "tests/webview-navigation-smoke.py", "--app", b.pathFromRoot(b.fmt("examples/webview/zig-out/bin/{s}", .{webview_exe_name})), "--cli" });
     webview_smoke_run.addFileArg(cli_exe.getEmittedBin());
     webview_smoke_run.step.dependOn(&webview_smoke_build.step);

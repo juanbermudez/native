@@ -96,11 +96,11 @@ const html =
     \\</html>
 ;
 
-const app_permissions = [_][]const u8{native_sdk.security.permission_window};
-const example_origins = [_][]const u8{ "zero://inline", "zero://app" };
-const bridge_policies = [_]native_sdk.BridgeCommandPolicy{.{ .name = "native.ping" }};
+pub const app_permissions = [_][]const u8{native_sdk.security.permission_window};
+pub const example_origins = [_][]const u8{ "zero://inline", "zero://app" };
+pub const bridge_policies = [_]native_sdk.BridgeCommandPolicy{.{ .name = "native.ping" }};
 const window_permission = [_][]const u8{native_sdk.security.permission_window};
-const builtin_policies = [_]native_sdk.BridgeCommandPolicy{
+pub const builtin_policies = [_]native_sdk.BridgeCommandPolicy{
     .{ .name = "native-sdk.window.list", .permissions = &window_permission, .origins = &example_origins },
     .{ .name = "native-sdk.window.create", .permissions = &window_permission, .origins = &example_origins },
     .{ .name = "native-sdk.window.focus", .permissions = &window_permission, .origins = &example_origins },
@@ -114,12 +114,12 @@ const builtin_policies = [_]native_sdk.BridgeCommandPolicy{
     .{ .name = "native-sdk.webview.close", .permissions = &window_permission, .origins = &example_origins },
 };
 
-const WebViewApp = struct {
+pub const WebViewApp = struct {
     ping_count: u32 = 0,
     bridge_handlers: [1]native_sdk.BridgeHandler = undefined,
     env_map: *std.process.Environ.Map,
 
-    fn app(self: *@This()) native_sdk.App {
+    pub fn app(self: *@This()) native_sdk.App {
         return .{ .context = self, .name = "webview", .source = native_sdk.WebViewSource.html(html), .source_fn = source };
     }
 
@@ -134,7 +134,7 @@ const WebViewApp = struct {
         return native_sdk.WebViewSource.html(html);
     }
 
-    fn bridge(self: *@This()) native_sdk.BridgeDispatcher {
+    pub fn bridge(self: *@This()) native_sdk.BridgeDispatcher {
         self.bridge_handlers = .{.{ .name = "native.ping", .context = self, .invoke_fn = ping }};
         return .{
             .policy = .{ .enabled = true, .commands = &bridge_policies },
@@ -160,7 +160,7 @@ pub fn main(init: std.process.Init) !void {
         .builtin_bridge = .{ .enabled = true, .commands = &builtin_policies },
         .security = .{
             .permissions = &app_permissions,
-            .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app", "https://example.com", "http://127.0.0.1:48765" } },
+            .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app", "https://example.com" } },
         },
     }, init);
 }

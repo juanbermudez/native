@@ -23,6 +23,7 @@ const WebEngineOption = enum {
 
 const default_native_sdk_path = "../../";
 const app_exe_name = "webview";
+const navigation_smoke_exe_name = "webview-navigation-smoke";
 
 pub fn build(b: *std.Build) void {
     const target = nativeSdkTarget(b);
@@ -32,6 +33,7 @@ pub fn build(b: *std.Build) void {
     const debug_overlay = b.option(bool, "debug-overlay", "Enable debug overlay output") orelse false;
     const automation_enabled = b.option(bool, "automation", "Enable Native SDK automation artifacts") orelse false;
     const js_bridge_enabled = b.option(bool, "js-bridge", "Enable optional JavaScript bridge stubs") orelse true;
+    const navigation_smoke = b.option(bool, "navigation-smoke", "Build the dedicated dynamic-origin navigation smoke executable") orelse false;
     const web_engine_override = b.option(WebEngineOption, "web-engine", "Override app.zon web engine: system, chromium");
     const cef_dir_override = b.option([]const u8, "cef-dir", "Override CEF root directory for Chromium builds");
     const cef_auto_install_override = b.option(bool, "cef-auto-install", "Override app.zon CEF auto-install setting");
@@ -78,11 +80,17 @@ pub fn build(b: *std.Build) void {
     runner_mod.addImport("build_options", options_mod);
     runner_mod.addImport("app_manifest_zon", b.createModule(.{ .root_source_file = b.path("app.zon") }));
 
-    const app_mod = localModule(b, target, optimize, "src/main.zig");
-    app_mod.addImport("native_sdk", native_sdk_mod);
-    app_mod.addImport("runner", runner_mod);
+    const webview_app_mod = localModule(b, target, optimize, "src/main.zig");
+    webview_app_mod.addImport("native_sdk", native_sdk_mod);
+    webview_app_mod.addImport("runner", runner_mod);
+    const app_mod = if (navigation_smoke) localModule(b, target, optimize, "src/navigation_smoke.zig") else webview_app_mod;
+    if (navigation_smoke) {
+        app_mod.addImport("native_sdk", native_sdk_mod);
+        app_mod.addImport("runner", runner_mod);
+        app_mod.addImport("webview_app", webview_app_mod);
+    }
     const exe = b.addExecutable(.{
-        .name = app_exe_name,
+        .name = if (navigation_smoke) navigation_smoke_exe_name else app_exe_name,
         .root_module = app_mod,
     });
     linkPlatform(b, target, app_mod, exe, selected_platform, web_engine, native_sdk_path, cef_dir, cef_auto_install);
