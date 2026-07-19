@@ -25,6 +25,12 @@ const platformWidgetAccessibilityTextRange = widget_bridge.platformWidgetAccessi
 const platformWidgetAccessibilityActions = widget_bridge.platformWidgetAccessibilityActions;
 const canvasWidgetSelectedState = widget_bridge.canvasWidgetSelectedState;
 
+comptime {
+    if (platform.max_widget_accessibility_nodes != canvas_limits.max_canvas_widget_semantics_per_view) {
+        @compileError("platform accessibility publication and runtime semantic-tree budgets must match");
+    }
+}
+
 pub fn RuntimeCanvasWidgetDisplay(comptime Runtime: type) type {
     return struct {
         pub fn emitCanvasWidgetDisplayList(self: *Runtime, window_id: platform.WindowId, label: []const u8, tokens: canvas.DesignTokens) anyerror!platform.ViewInfo {

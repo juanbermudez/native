@@ -983,6 +983,103 @@ test "runtime publishes canvas widget accessibility snapshots to platform" {
     try std.testing.expectEqual(published_count, platform_state.update_count);
 }
 
+test "runtime publishes a dense accessibility tree beyond the former 64 node boundary" {
+    const WidgetAccessibilityPlatform = struct {
+        node_count: usize = 0,
+        last_node_id: canvas.ObjectId = 0,
+
+        fn platformValue(self: *@This()) platform.Platform {
+            return .{
+                .context = self,
+                .name = "dense-widget-a11y",
+                .surface_value = .{ .id = 1, .size = geometry.SizeF.init(640, 480), .scale_factor = 1 },
+                .run_fn = run,
+                .services = .{
+                    .context = self,
+                    .load_webview_fn = loadWebView,
+                    .create_view_fn = createView,
+                    .focus_view_fn = focusView,
+                    .update_widget_accessibility_fn = updateWidgetAccessibility,
+                },
+            };
+        }
+
+        fn run(context: *anyopaque, handler: platform.EventHandler, handler_context: *anyopaque) anyerror!void {
+            _ = context;
+            _ = handler;
+            _ = handler_context;
+        }
+
+        fn createView(context: ?*anyopaque, options: platform.ViewOptions) anyerror!void {
+            _ = context;
+            _ = options;
+        }
+
+        fn focusView(context: ?*anyopaque, window_id: platform.WindowId, label: []const u8) anyerror!void {
+            _ = context;
+            _ = window_id;
+            _ = label;
+        }
+
+        fn loadWebView(context: ?*anyopaque, source: platform.WebViewSource) anyerror!void {
+            _ = context;
+            _ = source;
+        }
+
+        fn updateWidgetAccessibility(context: ?*anyopaque, snapshot: platform.WidgetAccessibilitySnapshot) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.node_count = snapshot.nodes.len;
+            self.last_node_id = if (snapshot.nodes.len == 0) 0 else snapshot.nodes[snapshot.nodes.len - 1].id;
+        }
+    };
+
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "dense-widget-platform-a11y", .source = platform.WebViewSource.html("<h1>Hello</h1>") };
+        }
+    };
+
+    var platform_state: WidgetAccessibilityPlatform = .{};
+    const runtime = try std.testing.allocator.create(Runtime);
+    defer std.testing.allocator.destroy(runtime);
+    Runtime.initAt(runtime, .{ .platform = platform_state.platformValue() });
+    var app_state: TestApp = .{};
+    try runtime.dispatchPlatformEvent(app_state.app(), .app_start);
+    _ = try runtime.createView(.{
+        .window_id = 1,
+        .label = "canvas",
+        .kind = .gpu_surface,
+        .frame = geometry.RectF.init(0, 0, 640, 480),
+    });
+
+    // One panel plus 256 controls covers the current dense evaluation
+    // cockpit with margin and is four times the former platform cap.
+    var children: [256]canvas.Widget = undefined;
+    for (&children, 0..) |*child, index| {
+        child.* = .{
+            .id = @intCast(index + 2),
+            .kind = .button,
+            .frame = geometry.RectF.init(
+                @floatFromInt((index % 5) * 120),
+                @floatFromInt((index / 5) * 32),
+                112,
+                28,
+            ),
+            .text = "Evaluation case",
+        };
+    }
+    var layout_nodes: [257]canvas.WidgetLayoutNode = undefined;
+    const layout = try canvas.layoutWidgetTree(.{
+        .id = 1,
+        .kind = .panel,
+        .children = &children,
+    }, geometry.RectF.init(0, 0, 640, 480), &layout_nodes);
+    _ = try runtime.setCanvasWidgetLayout(1, "canvas", layout);
+
+    try std.testing.expectEqual(@as(usize, 257), platform_state.node_count);
+    try std.testing.expectEqual(@as(canvas.ObjectId, 257), platform_state.last_node_id);
+}
+
 test "runtime automation snapshot exposes canvas icon roles" {
     const TestApp = struct {
         fn app(self: *@This()) App {

@@ -1,0 +1,1 @@
+fix: **Complete dense accessibility trees**: native canvas views now publish every semantic node up to the existing 1,024-node per-view runtime budget instead of silently truncating host assistive controls after 64 nodes; a compile-time contract keeps both budgets aligned.
