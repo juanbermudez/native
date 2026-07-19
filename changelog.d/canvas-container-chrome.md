@@ -1,0 +1,1 @@
+fix: **Authored canvas container chrome**: `stack`, `row`, and `column` widgets now paint explicit background and border styles in both tree and retained-layout render paths while structurally unstyled containers remain byte-identical and transparent.

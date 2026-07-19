@@ -209,7 +209,11 @@ fn emitWidgetDepthContent(builder: *Builder, widget: Widget, tokens: DesignToken
     const paint_widget = widgetWithFrame(widget, pixelSnapGeometryRect(tokens, widget.frame));
     try emitWidgetBackdropBlur(builder, paint_widget, tokens);
     switch (paint_widget.kind) {
-        .stack, .row, .column, .grid, .list, .breadcrumb, .pagination, .radio_group, .toggle_group, .split, .tree => try emitWidgetClippedChildren(builder, paint_widget, tokens, depth),
+        .stack, .row, .column => {
+            try emitContainerWidgetChrome(builder, paint_widget, tokens);
+            try emitWidgetClippedChildren(builder, paint_widget, tokens, depth);
+        },
+        .grid, .list, .breadcrumb, .pagination, .radio_group, .toggle_group, .split, .tree => try emitWidgetClippedChildren(builder, paint_widget, tokens, depth),
         .button_group => try emitButtonGroupWidget(builder, paint_widget, tokens, depth),
         .table, .data_grid => {
             try emitWidgetClippedChildren(builder, paint_widget, tokens, depth);
@@ -487,7 +491,8 @@ fn emitWidgetLayoutNodeContent(
     const paint_widget = widgetWithFrame(widget, pixelSnapGeometryRect(tokens, widget.frame));
     try emitWidgetBackdropBlur(builder, paint_widget, tokens);
     switch (paint_widget.kind) {
-        .stack, .row, .column, .breadcrumb, .button_group, .pagination, .radio_group, .toggle_group, .split, .tree => {},
+        .stack, .row, .column => try emitContainerWidgetChrome(builder, paint_widget, tokens),
+        .breadcrumb, .button_group, .pagination, .radio_group, .toggle_group, .split, .tree => {},
         .data_row => try emitDataRowWidgetWash(builder, paint_widget, tokens),
         .tabs => try widget_render_surfaces.emitTabsListWidgetChrome(builder, paint_widget, tokens),
         .table, .data_grid => {
@@ -795,6 +800,40 @@ fn emitSheetSurfaceWidget(builder: *Builder, widget: Widget, tokens: DesignToken
 fn emitPanelWidget(builder: *Builder, widget: Widget, tokens: DesignTokens, depth: usize) Error!void {
     try widget_render_surfaces.emitPanelWidgetChrome(builder, widget, tokens);
     try emitWidgetClippedChildren(builder, widget, tokens, depth);
+}
+
+/// Layout containers are structurally transparent by default, but their
+/// shared style contract still permits an explicit background and border.
+/// Honor only those authored channels: this keeps an ordinary row/column
+/// byte-identical while allowing full-surface app chassis and grouped rows
+/// without forcing a redundant panel wrapper around every layout node.
+fn emitContainerWidgetChrome(builder: *Builder, widget: Widget, tokens: DesignTokens) Error!void {
+    if (widget.style.background == null and widget.style.border == null) return;
+    const frame = widget.frame.normalized();
+    if (frame.isEmpty()) return;
+    const radius = widgetRadius(widget, 0);
+    if (widget.style.background) |background| {
+        try builder.fillRoundedRect(.{
+            .id = widgetPartId(widget.id, 1),
+            .rect = frame,
+            .radius = radius,
+            .fill = colorFill(background),
+        });
+    }
+    if (widget.style.border) |border| {
+        const stroke_width = widget_render_style.widgetStrokeWidth(widget, tokens.stroke.hairline);
+        if (stroke_width > 0) {
+            try builder.strokeRect(snapHairlineStrokeRect(tokens, .{
+                .id = widgetPartId(widget.id, 2),
+                .rect = frame,
+                .radius = radius,
+                .stroke = .{
+                    .fill = colorFill(border),
+                    .width = stroke_width,
+                },
+            }));
+        }
+    }
 }
 
 fn emitBubbleWidget(builder: *Builder, widget: Widget, tokens: DesignTokens, depth: usize) Error!void {

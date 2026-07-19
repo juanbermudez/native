@@ -353,6 +353,64 @@ const optionalF32Equal = support.optionalF32Equal;
 const optionalTextSelectionsEqual = support.optionalTextSelectionsEqual;
 const optionalTextRangesEqual = support.optionalTextRangesEqual;
 const widgetPartId = support.widgetPartId;
+
+test "row and column emit explicitly authored container chrome" {
+    const background = Color.rgb8(9, 10, 12);
+    const border = Color.rgb8(70, 74, 82);
+    const child = Widget{
+        .id = 42,
+        .kind = .text,
+        .frame = geometry.RectF.init(8, 8, 64, 18),
+        .text = "Lucy",
+    };
+    const children = [_]Widget{child};
+    const row = Widget{
+        .id = 41,
+        .kind = .row,
+        .frame = geometry.RectF.init(0, 0, 120, 36),
+        .style = .{
+            .background = background,
+            .border = border,
+            .radius = 8,
+            .stroke_width = 1,
+        },
+        .children = &children,
+    };
+
+    var commands: [8]CanvasCommand = undefined;
+    var builder = Builder.init(&commands);
+    try emitWidgetTree(&builder, row, .{});
+    const tree_list = builder.displayList();
+    switch (tree_list.findCommandById(widgetPartId(41, 1)).?.command) {
+        .fill_rounded_rect => |fill| {
+            try expectFillColor(background, fill.fill);
+            try std.testing.expectEqualDeep(Radius.all(8), fill.radius);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (tree_list.findCommandById(widgetPartId(41, 2)).?.command) {
+        .stroke_rect => |stroke| try expectFillColor(border, stroke.stroke.fill),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var nodes: [2]WidgetLayoutNode = undefined;
+    const column = Widget{
+        .id = 51,
+        .kind = .column,
+        .style = row.style,
+        .children = &children,
+    };
+    const layout = try layoutWidgetTree(column, geometry.RectF.init(0, 0, 120, 36), &nodes);
+    var layout_commands: [8]CanvasCommand = undefined;
+    var layout_builder = Builder.init(&layout_commands);
+    try emitWidgetLayout(&layout_builder, layout, .{});
+    const layout_list = layout_builder.displayList();
+    switch (layout_list.findCommandById(widgetPartId(51, 1)).?.command) {
+        .fill_rounded_rect => |fill| try expectFillColor(background, fill.fill),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(layout_list.findCommandById(widgetPartId(51, 2)) != null);
+}
 const colorWithAlpha = support.colorWithAlpha;
 const widgetControlHeight = support.widgetControlHeight;
 const textSelectionFillColor = support.textSelectionFillColor;
@@ -3295,8 +3353,8 @@ test "label-exact controls at intrinsic width never elide under geometry pixel s
     // edge, at both snap scales, across labels whose fractional widths
     // land on both sides of the rounding boundary.
     const kinds = [_]canvas.WidgetKind{
-        .toggle_button, .button,   .toggle, .segmented_control,
-        .menu_item,     .checkbox, .radio,  .switch_control,
+        .toggle_button, .button,   .toggle,    .segmented_control,
+        .menu_item,     .checkbox, .radio,     .switch_control,
         .tooltip,       .badge,    .list_item,
     };
     const labels = [_][]const u8{ "PID", "CPU", "Memory", "Name", "Filter processes", "Quarterly report" };
