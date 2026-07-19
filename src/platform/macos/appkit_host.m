@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include "spectrum_bins.h"
 
 @class NativeSdkAppKitHost;
 
@@ -9576,11 +9577,19 @@ static int NativeSdkSpectrumComputeBands(native_sdk_spectrum_tap_state_t *state,
     for (int band = 0; band < NATIVE_SDK_APPKIT_AUDIO_SPECTRUM_BANDS; band += 1) {
         const double low_hz = NATIVE_SDK_SPECTRUM_LOW_HZ * pow(ratio, (double)band / NATIVE_SDK_APPKIT_AUDIO_SPECTRUM_BANDS);
         const double high_hz = NATIVE_SDK_SPECTRUM_LOW_HZ * pow(ratio, (double)(band + 1) / NATIVE_SDK_APPKIT_AUDIO_SPECTRUM_BANDS);
-        int low_bin = (int)(low_hz / hz_per_bin);
-        int high_bin = (int)ceil(high_hz / hz_per_bin);
-        if (low_bin < 1) low_bin = 1;
-        if (high_bin > NATIVE_SDK_SPECTRUM_FFT_SIZE / 2 - 1) high_bin = NATIVE_SDK_SPECTRUM_FFT_SIZE / 2 - 1;
-        if (high_bin < low_bin) high_bin = low_bin;
+        const int requested_low_bin = (int)(low_hz / hz_per_bin);
+        const int requested_high_bin = (int)ceil(high_hz / hz_per_bin);
+        int low_bin = 0;
+        int high_bin = 0;
+        if (!NativeSdkSpectrumClampBinRange(
+                requested_low_bin,
+                requested_high_bin,
+                NATIVE_SDK_SPECTRUM_FFT_SIZE / 2 - 1,
+                &low_bin,
+                &high_bin)) {
+            bands[band] = 0;
+            continue;
+        }
         float peak = 0.0f;
         for (int bin = low_bin; bin <= high_bin; bin += 1) {
             if (power[bin] > peak) peak = power[bin];

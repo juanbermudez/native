@@ -127,6 +127,9 @@ pub fn build(b: *std.Build) void {
     const platform_info_tests = testArtifact(b, platform_info_mod);
     const json_tests = testArtifact(b, json_mod);
     const canvas_tests = testArtifact(b, canvas_mod);
+    const spectrum_bins_mod = module(b, target, optimize, "src/platform/macos/spectrum_bins_tests.zig");
+    spectrum_bins_mod.addIncludePath(b.path("src/platform/macos"));
+    const spectrum_bins_tests = testArtifact(b, spectrum_bins_mod);
 
     const desktop_mod = module(b, target, optimize, "src/root.zig");
     desktop_mod.addImport("geometry", geometry_mod);
@@ -416,6 +419,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(platform_info_tests).step);
     test_step.dependOn(&b.addRunArtifact(json_tests).step);
     test_step.dependOn(&b.addRunArtifact(canvas_tests).step);
+    test_step.dependOn(&b.addRunArtifact(spectrum_bins_tests).step);
     for (desktop_test_shards) |shard_tests| {
         test_step.dependOn(&b.addRunArtifact(shard_tests).step);
     }
@@ -1121,6 +1125,7 @@ pub fn build(b: *std.Build) void {
     addTestStep(b, "test-platform-info", "Run platform info module tests", platform_info_tests);
     addTestStep(b, "test-json", "Run JSON primitive tests", json_tests);
     addTestStep(b, "test-canvas", "Run canvas display list tests", canvas_tests);
+    addTestStep(b, "test-macos-spectrum-bins", "Run macOS audio spectrum bin-bound tests", spectrum_bins_tests);
     addTestStep(b, "test-desktop", "Run Native SDK framework tests", desktop_tests);
     for (desktop_test_shard_specs, desktop_test_shards) |spec, shard_tests| {
         addTestStep(b, b.fmt("test-desktop-{s}", .{spec.name}), spec.description, shard_tests);
