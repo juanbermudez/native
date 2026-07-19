@@ -282,6 +282,11 @@ pub const WindowRestorePolicy = enum {
     center_on_primary,
 };
 
+pub const WindowPresentation = enum {
+    standard,
+    hud,
+};
+
 /// How the window draws its titlebar chrome. `.hidden_inset` is the
 /// modern editor-app shape: content extends under a transparent titlebar
 /// with the title hidden (macOS keeps the traffic lights). The app's
@@ -478,6 +483,10 @@ pub const ShellWindow = struct {
     /// create, and the scene's first window here should declare the
     /// SAME style so the two never disagree.
     titlebar: WindowTitlebarStyle = .standard,
+    /// Host posture for bounded utility surfaces. `.hud` is currently a
+    /// macOS top-center transparent floating window; other hosts keep an
+    /// ordinary window.
+    presentation: WindowPresentation = .standard,
     /// Content min-size floor the window itself enforces (macOS
     /// `contentMinSize`): the resize stops at the floor instead of the
     /// layout clamping/clipping panes below it. 0 = no floor. Like

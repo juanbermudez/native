@@ -104,6 +104,11 @@ static int NativeSdkAppKitColorSchemeForAppearance(NSAppearance *appearance) {
 }
 
 static BOOL NativeSdkAppKitReduceMotionEnabled(void) {
+    /* Deterministic live/automation proof without mutating the user's
+     * system Accessibility setting. Unset everywhere in production;
+     * the real NSWorkspace preference remains the sole default. */
+    const char *forced = getenv("NATIVE_SDK_FORCE_REDUCE_MOTION");
+    if (forced && strcmp(forced, "1") == 0) return YES;
     return [NSWorkspace sharedWorkspace].accessibilityDisplayShouldReduceMotion;
 }
 
@@ -292,6 +297,21 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 }
 @end
 
+/// HUD panels are borderless and nonactivating, but still need a real
+/// key-window path after the user clicks them so keyboard traversal and
+/// Escape work without promoting the whole app to foreground.
+@interface NativeSdkHudPanel : NSPanel
+@end
+
+@implementation NativeSdkHudPanel
+- (BOOL)canBecomeKeyWindow {
+    return YES;
+}
+- (BOOL)canBecomeMainWindow {
+    return NO;
+}
+@end
+
 @interface NativeSdkWindowDelegate : NSObject <NSWindowDelegate>
 @property(nonatomic, assign) NativeSdkAppKitHost *host;
 @property(nonatomic, assign) uint64_t windowId;
@@ -372,6 +392,22 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 @property(nonatomic, assign) NSUInteger pixelY;
 @property(nonatomic, assign) NSUInteger pixelWidth;
 @property(nonatomic, assign) NSUInteger pixelHeight;
+@end
+
+/* One interruptible HUD-frame spring. Retargeting updates `targetFrame`
+ * and preserves velocity, so expand -> collapse during flight reverses
+ * from the rendered pose instead of restarting a canned transition. */
+@interface NativeSdkHudFrameSpring : NSObject
+@property(nonatomic, assign) NSRect currentFrame;
+@property(nonatomic, assign) NSRect targetFrame;
+@property(nonatomic, assign) CGFloat velocityX;
+@property(nonatomic, assign) CGFloat velocityY;
+@property(nonatomic, assign) CGFloat velocityWidth;
+@property(nonatomic, assign) CGFloat velocityHeight;
+@property(nonatomic, assign) CFTimeInterval retargetStartedAt;
+@end
+
+@implementation NativeSdkHudFrameSpring
 @end
 
 @implementation NativeSdkPacketCommandRaster
@@ -582,6 +618,7 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 @property(nonatomic, assign) BOOL controlClickActive;
 @property(nonatomic, assign) BOOL pinchGestureActive;
 - (void)configureWithHost:(NativeSdkAppKitHost *)host windowId:(uint64_t)windowId label:(NSString *)label;
+- (void)setSurfaceOpaque:(BOOL)opaque;
 - (BOOL)isAvailable;
 - (void)updateDrawableSize;
 - (BOOL)presentPixelsWithWidth:(NSUInteger)width height:(NSUInteger)height scale:(CGFloat)scale hasDirtyRect:(BOOL)hasDirtyRect dirtyX:(CGFloat)dirtyX dirtyY:(CGFloat)dirtyY dirtyWidth:(CGFloat)dirtyWidth dirtyHeight:(CGFloat)dirtyHeight dirtyRects:(NSArray<NSValue *> *)dirtyRects rgba8:(const uint8_t *)rgba8 byteLength:(NSUInteger)byteLength;
@@ -610,7 +647,7 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 - (void)requestRetainedCanvasFrame;
 - (void)noteGpuSurfaceInputActivity;
 - (void)rescheduleParkedFrameEventEmission;
-- (void)flushQueuedFirstCanvasFrameRequestNow;
+- (BOOL)flushQueuedFirstCanvasFrameRequestNow;
 - (void)advanceRetainedFramePacingClock;
 - (void)emitFirstCanvasFrameRequest;
 - (void)renderFrame;
@@ -664,6 +701,14 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NativeSdkBridgeScriptHandler *> *bridgeScriptHandlers;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NativeSdkAssetSchemeHandler *> *assetSchemeHandlers;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *windowLabels;
+/// Window ids using the transparent, top-center floating HUD posture.
+@property(nonatomic, strong) NSMutableSet<NSNumber *> *hudWindows;
+/// Active interruptible frame springs, keyed by HUD window id. One
+/// common-mode timer advances all of them so tracking/menu runloops do
+/// not freeze a morph midway.
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NativeSdkHudFrameSpring *> *hudFrameSprings;
+@property(nonatomic, strong) NSTimer *hudFrameSpringTimer;
+@property(nonatomic, assign) CFTimeInterval hudFrameSpringLastTick;
 /// Present-before-show bookkeeping: windows created with the deferred
 /// show policy stay ordered OUT until their first gpu-surface present
 /// lands (or the fallback deadline fires). Values are the creation
@@ -808,7 +853,19 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 @property(nonatomic, strong) NSArray<NSString *> *allowedExternalURLs;
 @property(nonatomic, assign) NSInteger externalLinkAction;
 - (instancetype)initWithAppName:(NSString *)appName displayName:(NSString *)displayName version:(NSString *)version aboutDescription:(NSString *)aboutDescription hasWebContent:(BOOL)hasWebContent windowTitle:(NSString *)windowTitle bundleIdentifier:(NSString *)bundleIdentifier iconPath:(NSString *)iconPath windowLabel:(NSString *)windowLabel x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy;
-- (BOOL)createWindowWithId:(uint64_t)windowId title:(NSString *)title label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy makeMain:(BOOL)makeMain;
+- (BOOL)createWindowWithId:(uint64_t)windowId title:(NSString *)title label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy presentation:(int)presentation makeMain:(BOOL)makeMain;
+- (BOOL)setWindowFrameWithId:(uint64_t)windowId x:(double)x y:(double)y width:(double)width height:(double)height transition:(int)transition;
+- (NSScreen *)screenForHudWindow:(NSWindow *)window;
+- (NSRect)anchoredHudFrameForWindow:(NSWindow *)window width:(CGFloat)width height:(CGFloat)height;
+- (void)applyHudChassisToWindow:(NSWindow *)window;
+- (void)beginHudFrameSpringForWindowId:(uint64_t)windowId targetFrame:(NSRect)targetFrame;
+- (void)advanceHudFrameSprings:(NSTimer *)timer;
+- (void)cancelHudFrameSpringForWindowId:(uint64_t)windowId;
+- (void)settleHudFrameSprings;
+- (void)reanchorHudWindowWithId:(uint64_t)windowId;
+- (void)reanchorHudWindows;
+- (void)screenParametersDidChange:(NSNotification *)notification;
+- (void)showWindowWithoutActivationIfHud:(uint64_t)windowId;
 - (void)showDeferredWindowIfPending:(uint64_t)windowId reason:(const char *)reason;
 - (void)applyWindowClearColor:(uint64_t)windowId red:(uint8_t)red green:(uint8_t)green blue:(uint8_t)blue alpha:(uint8_t)alpha;
 - (void)focusWindowWithId:(uint64_t)windowId;
@@ -965,6 +1022,13 @@ static void NativeSdkEmitGpuSurfaceResizes(NSView *view) {
     [self.host scheduleFrame];
 }
 
+- (void)windowDidChangeScreen:(NSNotification *)notification {
+    (void)notification;
+    [self.host reanchorHudWindowWithId:self.windowId];
+    [self.host emitWindowFrameForWindowId:self.windowId open:YES];
+    [self.host scheduleFrame];
+}
+
 - (void)windowDidBecomeKey:(NSNotification *)notification {
     (void)notification;
     [self.host emitWindowFrameForWindowId:self.windowId open:YES];
@@ -1086,6 +1150,7 @@ static void NativeSdkEmitGpuSurfaceResizes(NSView *view) {
     [self.host emitWindowFrameForWindowId:self.windowId open:NO];
     [self.host closeWebViewsInWindow:self.windowId];
     [self.host closeNativeViewsInWindow:self.windowId];
+    [self.host cancelHudFrameSpringForWindowId:self.windowId];
     NSNumber *key = @(self.windowId);
     [self.host.windows removeObjectForKey:key];
     [self.host.webViews removeObjectForKey:key];
@@ -1093,6 +1158,7 @@ static void NativeSdkEmitGpuSurfaceResizes(NSView *view) {
     [self.host.bridgeScriptHandlers removeObjectForKey:key];
     [self.host.assetSchemeHandlers removeObjectForKey:key];
     [self.host.windowLabels removeObjectForKey:key];
+    [self.host.hudWindows removeObject:key];
     [self.host.deferredShowWindows removeObjectForKey:key];
     [self.host.windowClearColors removeObjectForKey:key];
     [self.host.windowClosePolicies removeObjectForKey:key];
@@ -3420,6 +3486,10 @@ static NSDictionary *NativeSdkPacketDictionaryFromBinary(const uint8_t *bytes, N
     return self;
 }
 
+- (void)setSurfaceOpaque:(BOOL)opaque {
+    self.metalLayer.opaque = opaque;
+}
+
 - (void)configureWithHost:(NativeSdkAppKitHost *)host windowId:(uint64_t)windowId label:(NSString *)label {
     self.host = host;
     self.windowId = windowId;
@@ -5452,9 +5522,10 @@ static BOOL NativeSdkCompositeBlurWriteRegion(NSDictionary *command, CGFloat sca
 // runWithCallback calls this after its start/appearance/resize/frame
 // emits, when the host is between engine dispatches — the same safe
 // re-entry point those emits use.
-- (void)flushQueuedFirstCanvasFrameRequestNow {
-    if (!self.retainedFrameRequestPending || self.hasCanvasTexture) return;
+- (BOOL)flushQueuedFirstCanvasFrameRequestNow {
+    if (!self.retainedFrameRequestPending || self.hasCanvasTexture) return NO;
     [self emitFirstCanvasFrameRequest];
+    return YES;
 }
 
 // Advance the pacing clock for an emission that was SCHEDULED at
@@ -5776,6 +5847,21 @@ static BOOL NativeSdkCompositeBlurWriteRegion(NSDictionary *command, CGFloat sca
 }
 
 - (BOOL)acceptsFirstResponder {
+    return YES;
+}
+
+- (BOOL)needsPanelToBecomeKey {
+    /* NSPanel with `becomesKeyOnlyIfNeeded` asks the clicked view this
+     * question. Saying yes gives the HUD a WindowServer-owned keyboard
+     * route without activating its application. */
+    return YES;
+}
+
+- (BOOL)acceptsFirstMouse:(NSEvent *)event {
+    (void)event;
+    /* A nonactivating HUD must not require a dead first click merely to
+     * acquire keyboard routing. The same click both presses the canvas
+     * control and makes its panel key. */
     return YES;
 }
 
@@ -6740,6 +6826,12 @@ static double NativeSdkClampedPinchMagnification(double magnification) {
     self.bridgeScriptHandlers = [[NSMutableDictionary alloc] init];
     self.assetSchemeHandlers = [[NSMutableDictionary alloc] init];
     self.windowLabels = [[NSMutableDictionary alloc] init];
+    self.hudWindows = [[NSMutableSet alloc] init];
+    self.hudFrameSprings = [[NSMutableDictionary alloc] init];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(screenParametersDidChange:)
+                                                 name:NSApplicationDidChangeScreenParametersNotification
+                                               object:nil];
     self.deferredShowWindows = [[NSMutableDictionary alloc] init];
     self.windowClearColors = [[NSMutableDictionary alloc] init];
     self.windowClosePolicies = [[NSMutableDictionary alloc] init];
@@ -6759,7 +6851,7 @@ static double NativeSdkClampedPinchMagnification(double magnification) {
     [self configureApplication];
     NativeSdkLaunchLap("app_configured");
 
-    [self createWindowWithId:1 title:(windowTitle.length > 0 ? windowTitle : self.appName) label:self.windowLabel x:x y:y width:width height:height restoreFrame:restoreFrame resizable:resizable titlebarStyle:titlebarStyle showPolicy:showPolicy makeMain:YES];
+    [self createWindowWithId:1 title:(windowTitle.length > 0 ? windowTitle : self.appName) label:self.windowLabel x:x y:y width:width height:height restoreFrame:restoreFrame resizable:resizable titlebarStyle:titlebarStyle showPolicy:showPolicy presentation:0 makeMain:YES];
     self.didShutdown = NO;
     self.pendingPreRunStop = NO;
     self.observesApplicationActivation = NO;
@@ -6767,7 +6859,7 @@ static double NativeSdkClampedPinchMagnification(double magnification) {
     return self;
 }
 
-- (BOOL)createWindowWithId:(uint64_t)windowId title:(NSString *)title label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy makeMain:(BOOL)makeMain {
+- (BOOL)createWindowWithId:(uint64_t)windowId title:(NSString *)title label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy presentation:(int)presentation makeMain:(BOOL)makeMain {
     NSNumber *key = @(windowId);
     if (self.windows[key]) {
         return NO;
@@ -6799,15 +6891,23 @@ static double NativeSdkClampedPinchMagnification(double magnification) {
     // the drag channel's double-click convention) keep their OS
     // semantics; without Titled nothing is drawn. The app declares this
     // only when its chassis provides its own working window controls.
-    if (titlebarStyle == 3) {
+    if (titlebarStyle == 3 || presentation == 1) {
         styleMask = NSWindowStyleMaskBorderless |
                     NSWindowStyleMaskClosable |
                     NSWindowStyleMaskMiniaturizable;
+        if (presentation == 1) {
+            styleMask |= NSWindowStyleMaskNonactivatingPanel;
+        }
         if (resizable) {
             styleMask |= NSWindowStyleMaskResizable;
         }
     }
-    NSWindow *window = titlebarStyle == 3
+    NSWindow *window = presentation == 1
+        ? [[NativeSdkHudPanel alloc] initWithContentRect:rect
+                                              styleMask:styleMask
+                                                backing:NSBackingStoreBuffered
+                                                  defer:NO]
+        : titlebarStyle == 3
         ? [[NativeSdkChromelessWindow alloc] initWithContentRect:rect
                                                        styleMask:styleMask
                                                          backing:NSBackingStoreBuffered
@@ -6843,14 +6943,62 @@ static double NativeSdkClampedPinchMagnification(double magnification) {
         window.toolbarStyle = NSWindowToolbarStyleUnified;
         window.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;
     }
-    if (!restoreFrame) {
+    if (presentation == 1) {
+        NSPanel *panel = (NSPanel *)window;
+        /* Key transfer is explicit after a complete HUD click. Keeping
+         * this true prevents AppKit from changing key ownership at the
+         * mouseDown edge and swallowing press-on-release delivery. */
+        panel.becomesKeyOnlyIfNeeded = YES;
+        panel.hidesOnDeactivate = NO;
+        panel.floatingPanel = YES;
+        rect = [self anchoredHudFrameForWindow:window width:rect.size.width height:rect.size.height];
+        [window setFrame:rect display:NO animate:NO];
+        window.opaque = NO;
+        window.backgroundColor = NSColor.clearColor;
+        window.hasShadow = YES;
+        /*
+         * A floating-window level is still constrained below the menu-bar
+         * band, which produces a detached capsule at y=safeTop. The island
+         * must share the display's physical top edge, so place it one level
+         * above status items while staying far below screen-saver/lock UI.
+         */
+        window.level = NSStatusWindowLevel + 1;
+        window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                                    NSWindowCollectionBehaviorFullScreenAuxiliary |
+                                    NSWindowCollectionBehaviorStationary;
+        [self.hudWindows addObject:key];
+    } else if (!restoreFrame) {
         [window center];
     }
     if (makeMain) NativeSdkLaunchLap("window_chrome_ready");
 
-    NSView *container = [[NSView alloc] initWithFrame:rect];
+    NSView *container = nil;
+    if (presentation == 1) {
+        /*
+         * Keep application content OUTSIDE NSVisualEffectView's subtree.
+         * A Metal surface nested directly inside the effect view is treated
+         * as vibrant content: AppKit lifts its authored near-black chassis
+         * to the material's mid-gray, erasing panel hierarchy. The ordinary
+         * container owns clipping while the effect view is only a backdrop
+         * sibling below the app's native views.
+         */
+        container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, rect.size.width, rect.size.height)];
+        container.wantsLayer = YES;
+        NSVisualEffectView *material = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, rect.size.width, rect.size.height)];
+        material.material = NSVisualEffectMaterialHUDWindow;
+        material.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+        material.state = NSVisualEffectStateActive;
+        material.appearance = [NSAppearance appearanceNamed:NSAppearanceNameVibrantDark];
+        material.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        [container addSubview:material positioned:NSWindowBelow relativeTo:nil];
+    } else {
+        container = [[NSView alloc] initWithFrame:rect];
+    }
     container.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     window.contentView = container;
+    if (presentation == 1) {
+        [self applyHudChassisToWindow:window];
+    }
     // The window's MAIN WebView is created lazily
     // (`ensureMainWebViewForWindowId:`): a canvas-first app never loads
     // it, and instantiating WKWebView spins up the whole out-of-process
@@ -6895,10 +7043,245 @@ static double NativeSdkClampedPinchMagnification(double magnification) {
         self.delegate = delegate;
         self.windowLabel = label.length > 0 ? label : @"main";
     } else if (showPolicy != 1) {
-        [window makeKeyAndOrderFront:nil];
-        [NSApp activate];
+        [self showWindowWithoutActivationIfHud:windowId];
     }
     return YES;
+}
+
+- (NSScreen *)screenForHudWindow:(NSWindow *)window {
+    if (window.screen) return window.screen;
+    if (NSApp.keyWindow.screen) return NSApp.keyWindow.screen;
+    if (NSScreen.mainScreen) return NSScreen.mainScreen;
+    return NSScreen.screens.firstObject;
+}
+
+- (NSRect)anchoredHudFrameForWindow:(NSWindow *)window width:(CGFloat)width height:(CGFloat)height {
+    NSScreen *screen = [self screenForHudWindow:window];
+    NSRect screenFrame = screen ? screen.frame : NSMakeRect(0, 0, width, height);
+    /*
+     * This presentation is a notch-attached island, not a floating pill.
+     * It shares the physical top edge with the display; the app lays its
+     * compact left/right status around the notch and its expanded content
+     * below that crown. A separate floating-pill presentation would need a
+     * typed drag contract instead of silently inheriting this posture.
+     */
+    return NSMakeRect(
+        NSMidX(screenFrame) - width / 2.0,
+        NSMaxY(screenFrame) - height,
+        width,
+        height
+    );
+}
+
+- (void)applyHudChassisToWindow:(NSWindow *)window {
+    if (!window) return;
+    NSView *container = window.contentView;
+    container.wantsLayer = YES;
+    const CGFloat height = window.frame.size.height;
+    container.layer.cornerRadius = height <= 64.0 ? 16.0 : 22.0;
+    container.layer.cornerCurve = kCACornerCurveContinuous;
+    /*
+     * The top edge is deliberately square and flush with the display. Only
+     * the two bottom corners form the continuous island silhouette. Matching
+     * the host clip to the full-bleed canvas also removes the differently
+     * colored material wedges that were visible in all four window corners.
+     */
+    container.layer.maskedCorners = container.isFlipped
+        ? (kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner)
+        : (kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner);
+    const BOOL highContrast = NativeSdkAppKitHighContrastEnabled();
+    container.layer.borderWidth = highContrast ? 1.0 : 0.75;
+    container.layer.borderColor = [NSColor colorWithWhite:1.0 alpha:(highContrast ? 0.34 : 0.18)].CGColor;
+    container.layer.masksToBounds = YES;
+}
+
+static void NativeSdkAdvanceHudSpringComponent(CGFloat *position, CGFloat *velocity, CGFloat target, CGFloat dt) {
+    /* Slightly underdamped, fast-settling island motion. The fixed
+     * substep in `advanceHudFrameSprings:` keeps this stable after main
+     * thread stalls; velocity survives retargets. */
+    const CGFloat stiffness = 360.0;
+    const CGFloat damping = 34.0;
+    const CGFloat acceleration = stiffness * (target - *position) - damping * *velocity;
+    *velocity += acceleration * dt;
+    *position += *velocity * dt;
+}
+
+- (void)beginHudFrameSpringForWindowId:(uint64_t)windowId targetFrame:(NSRect)targetFrame {
+    NSNumber *key = @(windowId);
+    NSWindow *window = self.windows[key];
+    if (!window) return;
+    NativeSdkHudFrameSpring *spring = self.hudFrameSprings[key];
+    if (!spring) {
+        spring = [[NativeSdkHudFrameSpring alloc] init];
+        spring.velocityX = 0;
+        spring.velocityY = 0;
+        spring.velocityWidth = 0;
+        spring.velocityHeight = 0;
+        self.hudFrameSprings[key] = spring;
+    }
+    /* The window is the rendered truth. Reading it on every retarget
+     * makes a reversal start exactly where the previous tick landed. */
+    spring.currentFrame = window.frame;
+    spring.targetFrame = targetFrame;
+    spring.retargetStartedAt = CACurrentMediaTime();
+    if (self.hudFrameSpringTimer) return;
+    self.hudFrameSpringLastTick = CACurrentMediaTime();
+    NSTimer *timer = [NSTimer timerWithTimeInterval:(1.0 / 120.0)
+                                             target:self
+                                           selector:@selector(advanceHudFrameSprings:)
+                                           userInfo:nil
+                                            repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+    self.hudFrameSpringTimer = timer;
+}
+
+- (void)advanceHudFrameSprings:(NSTimer *)timer {
+    (void)timer;
+    const CFTimeInterval now = CACurrentMediaTime();
+    CGFloat elapsed = (CGFloat)(now - self.hudFrameSpringLastTick);
+    self.hudFrameSpringLastTick = now;
+    elapsed = MAX(1.0 / 240.0, MIN(elapsed, 1.0 / 30.0));
+    const NSUInteger steps = MAX((NSUInteger)1, (NSUInteger)ceil(elapsed / (1.0 / 120.0)));
+    const CGFloat dt = elapsed / (CGFloat)steps;
+    NSMutableArray<NSNumber *> *settled = [[NSMutableArray alloc] init];
+
+    for (NSNumber *key in self.hudFrameSprings.allKeys) {
+        NativeSdkHudFrameSpring *spring = self.hudFrameSprings[key];
+        NSWindow *window = self.windows[key];
+        if (!spring || !window) {
+            [settled addObject:key];
+            continue;
+        }
+        NSRect frame = spring.currentFrame;
+        CGFloat velocityX = spring.velocityX;
+        CGFloat velocityY = spring.velocityY;
+        CGFloat velocityWidth = spring.velocityWidth;
+        CGFloat velocityHeight = spring.velocityHeight;
+        for (NSUInteger step = 0; step < steps; step += 1) {
+            NativeSdkAdvanceHudSpringComponent(&frame.origin.x, &velocityX, spring.targetFrame.origin.x, dt);
+            NativeSdkAdvanceHudSpringComponent(&frame.origin.y, &velocityY, spring.targetFrame.origin.y, dt);
+            NativeSdkAdvanceHudSpringComponent(&frame.size.width, &velocityWidth, spring.targetFrame.size.width, dt);
+            NativeSdkAdvanceHudSpringComponent(&frame.size.height, &velocityHeight, spring.targetFrame.size.height, dt);
+        }
+        spring.velocityX = velocityX;
+        spring.velocityY = velocityY;
+        spring.velocityWidth = velocityWidth;
+        spring.velocityHeight = velocityHeight;
+        spring.currentFrame = frame;
+        const CGFloat distance = MAX(
+            MAX(fabs(frame.origin.x - spring.targetFrame.origin.x), fabs(frame.origin.y - spring.targetFrame.origin.y)),
+            MAX(fabs(frame.size.width - spring.targetFrame.size.width), fabs(frame.size.height - spring.targetFrame.size.height))
+        );
+        const CGFloat speed = MAX(
+            MAX(fabs(spring.velocityX), fabs(spring.velocityY)),
+            MAX(fabs(spring.velocityWidth), fabs(spring.velocityHeight))
+        );
+        const BOOL finite =
+            isfinite(frame.origin.x) && isfinite(frame.origin.y) &&
+            isfinite(frame.size.width) && isfinite(frame.size.height) &&
+            isfinite(speed) && isfinite(distance);
+        /* A visual morph must have a finite lifetime. Pixel rounding can
+         * otherwise leave a sub-point oscillator issuing no-op setFrame
+         * calls forever; with the pointer above the HUD, AppKit turns
+         * those into a display-rate mouse-move/input stream. */
+        const BOOL deadlineReached = (now - spring.retargetStartedAt) >= 1.25;
+        if (!finite || deadlineReached || (distance < 0.35 && speed < 2.0)) {
+            frame = spring.targetFrame;
+            [settled addObject:key];
+        }
+        const CGFloat scale = MAX(window.screen.backingScaleFactor, 1.0);
+        NSRect presentedFrame = NSMakeRect(
+            round(frame.origin.x * scale) / scale,
+            round(frame.origin.y * scale) / scale,
+            round(frame.size.width * scale) / scale,
+            round(frame.size.height * scale) / scale
+        );
+        if (!NSEqualRects(window.frame, presentedFrame)) {
+            [window setFrame:presentedFrame display:YES animate:NO];
+            [self applyHudChassisToWindow:window];
+        }
+    }
+    [self.hudFrameSprings removeObjectsForKeys:settled];
+    if (self.hudFrameSprings.count == 0) {
+        [self.hudFrameSpringTimer invalidate];
+        self.hudFrameSpringTimer = nil;
+        self.hudFrameSpringLastTick = 0;
+    }
+}
+
+- (void)cancelHudFrameSpringForWindowId:(uint64_t)windowId {
+    [self.hudFrameSprings removeObjectForKey:@(windowId)];
+    if (self.hudFrameSprings.count == 0) {
+        [self.hudFrameSpringTimer invalidate];
+        self.hudFrameSpringTimer = nil;
+        self.hudFrameSpringLastTick = 0;
+    }
+}
+
+- (void)settleHudFrameSprings {
+    for (NSNumber *key in self.hudFrameSprings.allKeys) {
+        NativeSdkHudFrameSpring *spring = self.hudFrameSprings[key];
+        NSWindow *window = self.windows[key];
+        if (!spring || !window) continue;
+        [window setFrame:spring.targetFrame display:YES animate:NO];
+        [self applyHudChassisToWindow:window];
+    }
+    [self.hudFrameSprings removeAllObjects];
+    [self.hudFrameSpringTimer invalidate];
+    self.hudFrameSpringTimer = nil;
+    self.hudFrameSpringLastTick = 0;
+}
+
+- (BOOL)setWindowFrameWithId:(uint64_t)windowId x:(double)x y:(double)y width:(double)width height:(double)height transition:(int)transition {
+    NSWindow *window = self.windows[@(windowId)];
+    if (!window) return NO;
+    const BOOL hud = [self.hudWindows containsObject:@(windowId)];
+    NSRect frame = hud
+        ? [self anchoredHudFrameForWindow:window width:width height:height]
+        : NSMakeRect(x, y, width, height);
+    if (hud && transition == 1 && !NativeSdkAppKitReduceMotionEnabled()) {
+        [self beginHudFrameSpringForWindowId:windowId targetFrame:frame];
+        return YES;
+    }
+    [self cancelHudFrameSpringForWindowId:windowId];
+    [window setFrame:frame display:YES animate:NO];
+    if (hud) [self applyHudChassisToWindow:window];
+    [self emitWindowFrameForWindowId:windowId open:YES];
+    [self emitResizeForWindowId:windowId];
+    [self scheduleFrame];
+    return YES;
+}
+
+- (void)reanchorHudWindowWithId:(uint64_t)windowId {
+    NSWindow *window = self.windows[@(windowId)];
+    if (!window || ![self.hudWindows containsObject:@(windowId)]) return;
+    NSRect frame = [self anchoredHudFrameForWindow:window width:window.frame.size.width height:window.frame.size.height];
+    if (NSEqualRects(frame, window.frame)) return;
+    [self cancelHudFrameSpringForWindowId:windowId];
+    [window setFrame:frame display:YES animate:NO];
+    [self applyHudChassisToWindow:window];
+}
+
+- (void)reanchorHudWindows {
+    for (NSNumber *windowId in self.hudWindows) {
+        [self reanchorHudWindowWithId:windowId.unsignedLongLongValue];
+    }
+}
+
+- (void)screenParametersDidChange:(NSNotification *)notification {
+    (void)notification;
+    [self reanchorHudWindows];
+}
+
+- (void)showWindowWithoutActivationIfHud:(uint64_t)windowId {
+    NSWindow *window = self.windows[@(windowId)];
+    if (!window) return;
+    if ([self.hudWindows containsObject:@(windowId)]) {
+        [window orderFrontRegardless];
+        return;
+    }
+    [window makeKeyAndOrderFront:nil];
+    [NSApp activate];
 }
 
 // Order a deferred-show window front exactly once — from the first
@@ -6915,8 +7298,7 @@ static double NativeSdkClampedPinchMagnification(double magnification) {
         const double elapsedMs = (double)(NativeSdkTimestampNanoseconds() - createdNs.unsignedLongLongValue) / 1e6;
         fprintf(stderr, "native-sdk: window %llu shown (%s) %.1f ms after create wall_ns=%llu\n", (unsigned long long)windowId, reason, elapsedMs, (unsigned long long)clock_gettime_nsec_np(CLOCK_REALTIME));
     }
-    [window makeKeyAndOrderFront:nil];
-    [NSApp activate];
+    [self showWindowWithoutActivationIfHud:windowId];
     [self emitWindowFrameForWindowId:windowId open:YES];
     [self scheduleFrame];
 }
@@ -6937,7 +7319,13 @@ static double NativeSdkClampedPinchMagnification(double magnification) {
 }
 
 - (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                    name:NSApplicationDidChangeScreenParametersNotification
+                                                  object:nil];
     [self invalidateAppTimers];
+    [self.hudFrameSpringTimer invalidate];
+    self.hudFrameSpringTimer = nil;
+    [self.hudFrameSprings removeAllObjects];
     [self audioStop];
     /* The vDSP plan outlives individual playbacks (created lazily
      * once); the host's end is where it retires. */
@@ -6962,8 +7350,7 @@ static double NativeSdkClampedPinchMagnification(double magnification) {
     // An explicit focus overrides a pending present-before-show defer:
     // the runtime asked for the window NOW.
     [self.deferredShowWindows removeObjectForKey:@(windowId)];
-    [window makeKeyAndOrderFront:nil];
-    [NSApp activate];
+    [self showWindowWithoutActivationIfHud:windowId];
     [self emitWindowFrameForWindowId:windowId open:YES];
     [self scheduleFrame];
 }
@@ -7448,6 +7835,9 @@ static double NativeSdkClampedPinchMagnification(double magnification) {
 
     NSView *view = [self makeNativeViewWithKind:kind label:label role:role text:text];
     if (!view) return NO;
+    if ([view isKindOfClass:[NativeSdkMetalSurfaceView class]] && [self.hudWindows containsObject:@(windowId)]) {
+        [(NativeSdkMetalSurfaceView *)view setSurfaceOpaque:NO];
+    }
     view.frame = [self viewFrameForContainer:parentView x:x y:y width:width height:height];
     view.hidden = !visible;
     view.layer.zPosition = layer;
@@ -8674,10 +9064,21 @@ static void NativeSdkApplyProcessDisplayName(NSString *displayName) {
     // would otherwise wait for [NSApp run]'s first queue pump. Emitting
     // it here puts first content on the glass before the run loop even
     // starts.
-    for (NSView *view in self.nativeViews.allValues) {
-        if ([view isKindOfClass:[NativeSdkMetalSurfaceView class]]) {
-            [(NativeSdkMetalSurfaceView *)view flushQueuedFirstCanvasFrameRequestNow];
+    // A first-frame callback may declare secondary canvas windows (UiApp
+    // `windows_fn` does exactly that). `allValues` is a point-in-time
+    // snapshot, so one pass would miss views created while flushing the
+    // startup canvas and leave them behind the first run-loop pump. Drain
+    // the bounded native-view set to a fixed point: every successful flush
+    // consumes one pending first request, and the platform view limit keeps
+    // adversarial declaration chains finite.
+    for (NSUInteger pass = 0; pass < NativeSdkMaxNativeViews; pass += 1) {
+        BOOL flushed = NO;
+        for (NSView *view in self.nativeViews.allValues) {
+            if ([view isKindOfClass:[NativeSdkMetalSurfaceView class]]) {
+                flushed = [(NativeSdkMetalSurfaceView *)view flushQueuedFirstCanvasFrameRequestNow] || flushed;
+            }
         }
+        if (!flushed) break;
     }
 
     // The appearance/resize/window-frame emits and the synchronous
@@ -8827,6 +9228,12 @@ static void NativeSdkApplyProcessDisplayName(NSString *displayName) {
 
 - (void)accessibilityDisplayOptionsDidChange:(NSNotification *)notification {
     (void)notification;
+    if (NativeSdkAppKitReduceMotionEnabled()) {
+        [self settleHudFrameSprings];
+    }
+    for (NSNumber *windowId in self.hudWindows) {
+        [self applyHudChassisToWindow:self.windows[windowId]];
+    }
     [self emitAppearanceChanged];
 }
 
@@ -10454,11 +10861,16 @@ void native_sdk_appkit_set_shortcuts(native_sdk_appkit_host_t *host, const char 
     [object setShortcutsWithIds:ids idLengths:id_lens keys:keys keyLengths:key_lens modifiers:modifiers count:count];
 }
 
-int native_sdk_appkit_create_window(native_sdk_appkit_host_t *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy) {
+int native_sdk_appkit_create_window(native_sdk_appkit_host_t *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy, int presentation) {
     NativeSdkAppKitHost *object = (__bridge NativeSdkAppKitHost *)host;
     NSString *titleString = window_title ? [[NSString alloc] initWithBytes:window_title length:window_title_len encoding:NSUTF8StringEncoding] : @"";
     NSString *labelString = window_label ? [[NSString alloc] initWithBytes:window_label length:window_label_len encoding:NSUTF8StringEncoding] : @"";
-    return [object createWindowWithId:window_id title:titleString ?: @"" label:labelString ?: @"" x:x y:y width:width height:height restoreFrame:(restore_frame != 0) resizable:(resizable != 0) titlebarStyle:titlebar_style showPolicy:show_policy makeMain:NO] ? 1 : 0;
+    return [object createWindowWithId:window_id title:titleString ?: @"" label:labelString ?: @"" x:x y:y width:width height:height restoreFrame:(restore_frame != 0) resizable:(resizable != 0) titlebarStyle:titlebar_style showPolicy:show_policy presentation:presentation makeMain:NO] ? 1 : 0;
+}
+
+int native_sdk_appkit_set_window_frame(native_sdk_appkit_host_t *host, uint64_t window_id, double x, double y, double width, double height, int transition) {
+    NativeSdkAppKitHost *object = (__bridge NativeSdkAppKitHost *)host;
+    return [object setWindowFrameWithId:window_id x:x y:y width:width height:height transition:transition] ? 1 : 0;
 }
 
 int native_sdk_appkit_set_window_content_min_size(native_sdk_appkit_host_t *host, uint64_t window_id, double min_width, double min_height) {

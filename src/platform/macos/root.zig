@@ -146,7 +146,8 @@ extern fn native_sdk_appkit_set_security_policy(host: *AppKitHost, allowed_origi
 extern fn native_sdk_appkit_set_menus(host: *AppKitHost, menu_titles: [*]const [*]const u8, menu_title_lens: [*]const usize, menu_count: usize, item_menu_indices: [*]const u32, item_labels: [*]const [*]const u8, item_label_lens: [*]const usize, item_commands: [*]const [*]const u8, item_command_lens: [*]const usize, item_keys: [*]const [*]const u8, item_key_lens: [*]const usize, item_modifiers: [*]const u32, item_separators: [*]const c_int, item_enabled: [*]const c_int, item_checked: [*]const c_int, item_count: usize) void;
 extern fn native_sdk_appkit_set_shortcuts(host: *AppKitHost, ids: [*]const [*]const u8, id_lens: [*]const usize, keys: [*]const [*]const u8, key_lens: [*]const usize, modifiers: [*]const u32, count: usize) void;
 extern fn native_sdk_appkit_request_frame(host: *AppKitHost) void;
-extern fn native_sdk_appkit_create_window(host: *AppKitHost, window_id: u64, window_title: [*]const u8, window_title_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int, resizable: c_int, titlebar_style: c_int, show_policy: c_int) c_int;
+extern fn native_sdk_appkit_create_window(host: *AppKitHost, window_id: u64, window_title: [*]const u8, window_title_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int, resizable: c_int, titlebar_style: c_int, show_policy: c_int, presentation: c_int) c_int;
+extern fn native_sdk_appkit_set_window_frame(host: *AppKitHost, window_id: u64, x: f64, y: f64, width: f64, height: f64, transition: c_int) c_int;
 extern fn native_sdk_appkit_set_window_content_min_size(host: *AppKitHost, window_id: u64, min_width: f64, min_height: f64) c_int;
 extern fn native_sdk_appkit_focus_window(host: *AppKitHost, window_id: u64) c_int;
 extern fn native_sdk_appkit_close_window(host: *AppKitHost, window_id: u64) c_int;
@@ -591,6 +592,7 @@ pub const MacPlatform = struct {
                 .complete_window_bridge_fn = completeWindowBridge,
                 .complete_webview_bridge_fn = completeWebViewBridge,
                 .create_window_fn = createWindow,
+                .set_window_frame_fn = setWindowFrame,
                 .focus_window_fn = focusWindow,
                 .close_window_fn = closeWindow,
                 .minimize_window_fn = minimizeWindow,
@@ -1088,6 +1090,20 @@ fn applyWindowClosePolicy(host: *AppKitHost, window_id: u64, policy: platform_mo
     _ = native_sdk_appkit_set_window_close_policy(host, window_id, closePolicyInt(policy));
 }
 
+fn presentationInt(value: platform_mod.WindowPresentation) c_int {
+    return switch (value) {
+        .standard => 0,
+        .hud => 1,
+    };
+}
+
+fn frameTransitionInt(value: platform_mod.WindowFrameTransition) c_int {
+    return switch (value) {
+        .immediate => 0,
+        .spring => 1,
+    };
+}
+
 /// Apply a declared content min-size floor to a created window
 /// (AppKit `contentMinSize`). Zero/negative/non-finite floors are the
 /// "no floor" sentinel and skip the call — the window keeps AppKit's
@@ -1103,7 +1119,7 @@ fn createWindow(context: ?*anyopaque, options: platform_mod.WindowOptions) anyer
     const self: *MacPlatform = @ptrCast(@alignCast(context.?));
     const title = options.resolvedTitle(self.app_info.app_name);
     const frame = options.default_frame;
-    if (native_sdk_appkit_create_window(self.host, options.id, title.ptr, title.len, options.label.ptr, options.label.len, frame.x, frame.y, frame.width, frame.height, if (options.restore_state) 1 else 0, if (options.resizable) 1 else 0, titlebarStyleInt(options.titlebar), showModeInt(options.show)) == 0) return error.CreateFailed;
+    if (native_sdk_appkit_create_window(self.host, options.id, title.ptr, title.len, options.label.ptr, options.label.len, frame.x, frame.y, frame.width, frame.height, if (options.restore_state) 1 else 0, if (options.resizable) 1 else 0, titlebarStyleInt(options.titlebar), showModeInt(options.show), presentationInt(options.presentation)) == 0) return error.CreateFailed;
     applyWindowContentMinSize(self.host, options.id, options.min_width, options.min_height);
     applyWindowClosePolicy(self.host, options.id, options.close_policy);
     return .{
@@ -1115,6 +1131,13 @@ fn createWindow(context: ?*anyopaque, options: platform_mod.WindowOptions) anyer
         .open = true,
         .focused = false,
     };
+}
+
+fn setWindowFrame(context: ?*anyopaque, window_id: platform_mod.WindowId, frame: geometry.RectF, transition: platform_mod.WindowFrameTransition) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    if (native_sdk_appkit_set_window_frame(self.host, window_id, frame.x, frame.y, frame.width, frame.height, frameTransitionInt(transition)) == 0) {
+        return error.WindowNotFound;
+    }
 }
 
 fn focusWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {

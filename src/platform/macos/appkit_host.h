@@ -370,7 +370,13 @@ void native_sdk_appkit_emit_window_event(native_sdk_appkit_host_t *host, uint64_
 void native_sdk_appkit_set_security_policy(native_sdk_appkit_host_t *host, const char *allowed_origins, size_t allowed_origins_len, const char *external_urls, size_t external_urls_len, int external_action);
 void native_sdk_appkit_set_menus(native_sdk_appkit_host_t *host, const char *const *menu_titles, const size_t *menu_title_lens, size_t menu_count, const uint32_t *item_menu_indices, const char *const *item_labels, const size_t *item_label_lens, const char *const *item_commands, const size_t *item_command_lens, const char *const *item_keys, const size_t *item_key_lens, const uint32_t *item_modifiers, const int *item_separators, const int *item_enabled, const int *item_checked, size_t item_count);
 void native_sdk_appkit_set_shortcuts(native_sdk_appkit_host_t *host, const char *const *ids, const size_t *id_lens, const char *const *keys, const size_t *key_lens, const uint32_t *modifiers, size_t count);
-int native_sdk_appkit_create_window(native_sdk_appkit_host_t *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy);
+int native_sdk_appkit_create_window(native_sdk_appkit_host_t *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy, int presentation);
+// Retarget a live window without replacing its NSWindow identity.
+// HUD windows preserve their current display and recompute their
+// top-center safe-area anchor from the requested content size.
+// transition: 0 = immediate, 1 = interruptible spring (reduce-motion
+// always snaps).
+int native_sdk_appkit_set_window_frame(native_sdk_appkit_host_t *host, uint64_t window_id, double x, double y, double width, double height, int transition);
 // Content min-size floor for a created window (NSWindow contentMinSize):
 // the user's resize stops at the floor. Values <= 0 leave that axis at
 // AppKit's default minimum. Returns 0 when the window id is unknown.

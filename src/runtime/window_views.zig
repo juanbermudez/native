@@ -31,6 +31,7 @@ pub fn RuntimeWindowViews(comptime Runtime: type) type {
         pub const createWindow = WindowStorageMethods.createWindow;
         pub const listWindows = WindowStorageMethods.listWindows;
         pub const focusWindow = WindowStorageMethods.focusWindow;
+        pub const setWindowFrame = WindowStorageMethods.setWindowFrame;
         pub const createWindowWithSourceMode = WindowStorageMethods.createWindowWithSourceMode;
         pub const reserveWindow = WindowStorageMethods.reserveWindow;
         pub const removeWindowAt = WindowStorageMethods.removeWindowAt;
@@ -230,6 +231,7 @@ pub fn RuntimeWindowViews(comptime Runtime: type) type {
                 .restore_policy = shellRestorePolicy(shell_window.restore_policy),
                 .titlebar = shell_layout.shellTitlebarStyle(shell_window.titlebar),
                 .show = shell_layout.shellWindowShowMode(shell_window),
+                .presentation = shell_layout.shellWindowPresentation(shell_window.presentation),
                 .min_width = shell_window.min_width,
                 .min_height = shell_window.min_height,
                 .close_policy = shell_layout.shellClosePolicy(shell_window.close_policy),

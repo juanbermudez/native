@@ -301,6 +301,13 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             /// titlebar-control channel's scope, not this field's.
             /// Platforms without the concept keep standard chrome.
             titlebar: app_manifest.WindowTitlebarStyle = .standard,
+            /// Utility-window posture. `.hud` requests Native's macOS
+            /// top-center transparent floating host.
+            presentation: app_manifest.WindowPresentation = .standard,
+            /// In-place geometry retarget policy. Immediate remains the
+            /// default for ordinary utility windows; HUD-like surfaces
+            /// can opt into a host spring without changing identity.
+            frame_transition: platform.WindowFrameTransition = .immediate,
             /// Msg dispatched when the USER closes the window (never for
             /// a reconcile close the model itself initiated). The
             /// dismissal precedent: the window is already gone as an
@@ -689,7 +696,13 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             canvas_label_len: usize = 0,
             window_id: platform.WindowId = 0,
             on_close: ?MsgT = null,
+            presentation: app_manifest.WindowPresentation = .standard,
             installed: bool = false,
+            /// Last descriptor-controlled geometry accepted by the
+            /// platform. Kept apart from `canvas_size`, which follows
+            /// live platform frames, so ordinary user moves/resizes do
+            /// not get undone on every model rebuild.
+            declared_frame: geometry.RectF = geometry.RectF.init(0, 0, 1, 1),
             canvas_size: geometry.SizeF = .{ .width = 1, .height = 1 },
             /// The device scale of THIS window's surface, adopted from
             /// its own frame and resize events. Secondary windows can sit
@@ -1846,11 +1859,71 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
 
             for (declared) |descriptor| {
                 if (self.windowSlotIndexByLabel(descriptor.label)) |slot_index| {
-                    // Already live: the close Msg follows the model.
-                    self.window_slots[slot_index].on_close = descriptor.on_close;
+                    // Already live: mutable descriptor geometry
+                    // retargets the same OS window; identity-bearing
+                    // labels remain stable.
+                    const slot = &self.window_slots[slot_index];
+                    slot.on_close = descriptor.on_close;
+                    retargetWindowSlot(runtime, slot, descriptor);
                     continue;
                 }
                 self.createWindowSlot(runtime, descriptor);
+            }
+        }
+
+        fn retargetWindowSlot(runtime: *Runtime, slot: *WindowSlot, descriptor: WindowDescriptor) void {
+            if (!std.mem.eql(u8, slot.canvasLabel(), descriptor.canvas_label)) {
+                ui_app_log.warn(
+                    "declared window '{s}' ignored canvas-label change '{s}' -> '{s}'; identity labels are immutable while live",
+                    .{ descriptor.label, slot.canvasLabel(), descriptor.canvas_label },
+                );
+                return;
+            }
+            if (slot.presentation != descriptor.presentation) {
+                ui_app_log.warn(
+                    "declared window '{s}' ignored presentation change '{s}' -> '{s}'; presentation is immutable while live",
+                    .{ descriptor.label, @tagName(slot.presentation), @tagName(descriptor.presentation) },
+                );
+                return;
+            }
+            const size_changed =
+                slot.declared_frame.width != descriptor.width or
+                slot.declared_frame.height != descriptor.height;
+            const x_changed = if (descriptor.x) |x| slot.declared_frame.x != x else false;
+            const y_changed = if (descriptor.y) |y| slot.declared_frame.y != y else false;
+            if (!size_changed and !x_changed and !y_changed) return;
+
+            // Null descriptor origins mean "leave the live origin
+            // alone", including after a user move. A size-only model
+            // transition must not teleport an ordinary window to (0,0).
+            var current = slot.declared_frame;
+            var windows: [platform.max_windows]platform.WindowInfo = undefined;
+            for (runtime.listWindows(&windows)) |window| {
+                if (window.id == slot.window_id) {
+                    current = window.frame;
+                    break;
+                }
+            }
+            const desired = geometry.RectF.init(
+                descriptor.x orelse current.x,
+                descriptor.y orelse current.y,
+                descriptor.width,
+                descriptor.height,
+            );
+            runtime.setWindowFrame(slot.window_id, desired, descriptor.frame_transition) catch |err| {
+                ui_app_log.warn("declared window '{s}' frame retarget failed: {s}", .{ descriptor.label, @errorName(err) });
+                return;
+            };
+            runtime.relayoutShellViews(slot.window_id) catch |err| {
+                ui_app_log.warn("declared window '{s}' view relayout after frame retarget failed: {s}", .{ descriptor.label, @errorName(err) });
+                return;
+            };
+            slot.declared_frame = desired;
+            // A spring's canvas follows platform resize events through
+            // each rendered pose. Immediate retargets keep the existing
+            // synchronous size update.
+            if (descriptor.frame_transition == .immediate) {
+                slot.canvas_size = desired.size();
             }
         }
 
@@ -1914,6 +1987,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 .y = descriptor.y,
                 .resizable = descriptor.resizable,
                 .titlebar = descriptor.titlebar,
+                .presentation = descriptor.presentation,
                 .min_width = descriptor.min_width,
                 .min_height = descriptor.min_height,
                 // Deterministic reopen: the descriptor is the geometry
@@ -1932,7 +2006,14 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             @memcpy(slot.canvas_label_storage[0..descriptor.canvas_label.len], descriptor.canvas_label);
             slot.window_id = info.id;
             slot.on_close = descriptor.on_close;
+            slot.presentation = descriptor.presentation;
             slot.installed = false;
+            slot.declared_frame = geometry.RectF.init(
+                descriptor.x orelse info.frame.x,
+                descriptor.y orelse info.frame.y,
+                descriptor.width,
+                descriptor.height,
+            );
             slot.canvas_size = .{ .width = descriptor.width, .height = descriptor.height };
             // Until this window's first frame reports its real density,
             // assume the main canvas's — new windows usually open on the
@@ -3138,7 +3219,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // invalidates before the first present, and the surface would
             // stay blank until the first input arrives.
             const services = runtime.options.platform.services;
-            const clear_color = self.effectiveTokens().colors.background;
+            var clear_color = self.effectiveTokens().colors.background;
+            if (self.windowSlotByCanvasLabel(canvas_label)) |slot| {
+                if (slot.presentation == .hud) clear_color.a = 0;
+            }
             var packet_attempted = false;
             if (services.present_gpu_surface_packet_fn != null or services.present_gpu_surface_packet_binary_fn != null) {
                 packet_attempted = true;

@@ -2330,14 +2330,26 @@ void native_sdk_appkit_set_shortcuts(native_sdk_appkit_host_t *host, const char 
     [object setShortcutsWithIds:ids idLengths:id_lens keys:keys keyLengths:key_lens modifiers:modifiers count:count];
 }
 
-int native_sdk_appkit_create_window(native_sdk_appkit_host_t *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy) {
+int native_sdk_appkit_create_window(native_sdk_appkit_host_t *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy, int presentation) {
     // Accepted for ABI parity; see native_sdk_appkit_create.
     (void)show_policy;
+    // Chromium windows retain their ordinary document presentation for
+    // now; the typed posture is implemented by the system/AppKit host.
+    (void)presentation;
     NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     NSString *titleString = window_title ? [[NSString alloc] initWithBytes:window_title length:window_title_len encoding:NSUTF8StringEncoding] : @"native-sdk";
     NSString *labelString = window_label ? [[NSString alloc] initWithBytes:window_label length:window_label_len encoding:NSUTF8StringEncoding] : @"";
     if (![object createWindowWithId:window_id title:titleString ?: @"native-sdk" label:labelString ?: @"" x:x y:y width:width height:height restoreFrame:(restore_frame != 0) resizable:(resizable != 0) makeMain:NO]) return 0;
     NativeSdkApplyHiddenInsetTitlebar(object.windows[@(window_id)], titlebar_style, object.delegates[@(window_id)]);
+    return 1;
+}
+
+int native_sdk_appkit_set_window_frame(native_sdk_appkit_host_t *host, uint64_t window_id, double x, double y, double width, double height, int transition) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
+    NSWindow *window = object.windows[@(window_id)];
+    if (!window) return 0;
+    (void)transition;
+    [window setFrame:NativeSdkConstrainFrame(NSMakeRect(x, y, width, height)) display:YES animate:NO];
     return 1;
 }
 

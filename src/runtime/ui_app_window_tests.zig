@@ -20,12 +20,15 @@ const settings_window_label = "settings";
 
 const PanelModel = struct {
     settings_open: bool = false,
+    hud: bool = false,
+    expanded: bool = false,
     bumps: u32 = 0,
     user_closes: u32 = 0,
 };
 
 const PanelMsg = union(enum) {
     toggle_settings,
+    toggle_size,
     bump,
     settings_closed,
 };
@@ -35,6 +38,7 @@ const PanelApp = ui_app_model.UiApp(PanelModel, PanelMsg);
 fn panelUpdate(model: *PanelModel, msg: PanelMsg) void {
     switch (msg) {
         .toggle_settings => model.settings_open = !model.settings_open,
+        .toggle_size => model.expanded = !model.expanded,
         .bump => model.bumps += 1,
         .settings_closed => {
             model.settings_open = false;
@@ -57,10 +61,12 @@ fn panelWindows(model: *const PanelModel, scratch: *PanelApp.WindowsScratch) []c
             .label = settings_window_label,
             .canvas_label = settings_canvas_label,
             .title = "Settings",
-            .width = 320,
-            .height = 240,
+            .width = if (model.expanded) 420 else 320,
+            .height = if (model.expanded) 360 else 240,
             .min_width = 280,
             .min_height = 200,
+            .presentation = if (model.hud) .hud else .standard,
+            .frame_transition = if (model.hud) .spring else .immediate,
             .on_close = .settings_closed,
         };
         count += 1;
@@ -224,6 +230,129 @@ test "a Msg declares the settings window, its canvas installs, and automation dr
     try std.testing.expect(fixture.app_state.model.settings_open);
     const reopened = fixture.settingsWindowInfo() orelse return error.TestUnexpectedResult;
     try std.testing.expect(reopened.open);
+}
+
+test "HUD presentation reaches the platform seam and clears its canvas transparently" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    fixture.app_state.model.hud = true;
+
+    try fixture.clickSettingsButton();
+    const info = fixture.settingsWindowInfo() orelse return error.TestUnexpectedResult;
+    var found = false;
+    for (fixture.harness.null_platform.windows[0..fixture.harness.null_platform.window_count], 0..) |window, index| {
+        if (window.id != info.id) continue;
+        try std.testing.expectEqual(support.platform.WindowPresentation.hud, fixture.harness.null_platform.window_presentation[index]);
+        found = true;
+    }
+    try std.testing.expect(found);
+
+    try fixture.installSettingsCanvas(info.id);
+    try std.testing.expectEqual(@as(u8, 0), fixture.harness.null_platform.gpu_surface_packet_present_clear_color_rgba8[3]);
+    try fixture.app_state.dispatch(&fixture.harness.runtime, 1, .toggle_size);
+    for (fixture.harness.null_platform.windows[0..fixture.harness.null_platform.window_count], 0..) |window, index| {
+        if (window.id != info.id) continue;
+        try std.testing.expectEqual(support.platform.WindowFrameTransition.spring, fixture.harness.null_platform.window_frame_transition[index]);
+        try std.testing.expectEqual(@as(f32, 420), window.frame.width);
+    }
+    // The service knows the destination immediately, but runtime
+    // geometry stays at the rendered pose until the platform reports an
+    // animated frame. This prevents transient fake target frames in
+    // automation and lets every intermediate resize remain truthful.
+    const before_platform_tick = fixture.settingsWindowInfo() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(f32, 320), before_platform_tick.frame.width);
+    try fixture.harness.runtime.dispatchPlatformEvent(fixture.app, .{ .window_frame_changed = .{
+        .id = info.id,
+        .label = settings_window_label,
+        .title = "Settings",
+        .frame = geometry.RectF.init(12, 34, 360, 300),
+        .scale_factor = 2,
+        .open = true,
+        .focused = false,
+    } });
+    const after_platform_tick = fixture.settingsWindowInfo() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(f32, 360), after_platform_tick.frame.width);
+}
+
+test "a declared window retargets its frame without replacing its identity" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+
+    try fixture.clickSettingsButton();
+    const compact = fixture.settingsWindowInfo() orelse return error.TestUnexpectedResult;
+    try fixture.installSettingsCanvas(compact.id);
+    const window_count = fixture.harness.null_platform.window_count;
+
+    try fixture.app_state.dispatch(&fixture.harness.runtime, 1, .toggle_size);
+
+    const expanded = fixture.settingsWindowInfo() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(compact.id, expanded.id);
+    try std.testing.expectEqual(window_count, fixture.harness.null_platform.window_count);
+    try std.testing.expectEqual(@as(f32, 420), expanded.frame.width);
+    try std.testing.expectEqual(@as(f32, 360), expanded.frame.height);
+    var index: ?usize = null;
+    for (fixture.harness.null_platform.windows[0..fixture.harness.null_platform.window_count], 0..) |window, candidate| {
+        if (window.id == expanded.id) index = candidate;
+    }
+    const window_index = index orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), fixture.harness.null_platform.window_frame_update_count[window_index]);
+    try std.testing.expectEqual(support.platform.WindowFrameTransition.immediate, fixture.harness.null_platform.window_frame_transition[window_index]);
+
+    try fixture.app_state.dispatch(&fixture.harness.runtime, 1, .toggle_size);
+    const collapsed = fixture.settingsWindowInfo() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(compact.id, collapsed.id);
+    try std.testing.expectEqual(@as(f32, 320), collapsed.frame.width);
+    try std.testing.expectEqual(@as(f32, 240), collapsed.frame.height);
+    try std.testing.expectEqual(@as(u32, 2), fixture.harness.null_platform.window_frame_update_count[window_index]);
+}
+
+test "a live window rejects presentation mutation without changing its host or frame" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+
+    try fixture.clickSettingsButton();
+    const standard = fixture.settingsWindowInfo() orelse return error.TestUnexpectedResult;
+    try fixture.installSettingsCanvas(standard.id);
+    var index: ?usize = null;
+    for (fixture.harness.null_platform.windows[0..fixture.harness.null_platform.window_count], 0..) |window, candidate| {
+        if (window.id == standard.id) index = candidate;
+    }
+    const window_index = index orelse return error.TestUnexpectedResult;
+
+    fixture.app_state.model.hud = true;
+    try fixture.app_state.dispatch(&fixture.harness.runtime, 1, .toggle_size);
+
+    const unchanged = fixture.settingsWindowInfo() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(standard.id, unchanged.id);
+    try std.testing.expectEqual(@as(f32, 320), unchanged.frame.width);
+    try std.testing.expectEqual(@as(f32, 240), unchanged.frame.height);
+    try std.testing.expectEqual(support.platform.WindowPresentation.standard, fixture.harness.null_platform.window_presentation[window_index]);
+    try std.testing.expectEqual(@as(u32, 0), fixture.harness.null_platform.window_frame_update_count[window_index]);
+}
+
+test "a size-only descriptor retarget preserves the live window origin" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+
+    try fixture.clickSettingsButton();
+    const compact = fixture.settingsWindowInfo() orelse return error.TestUnexpectedResult;
+    try fixture.installSettingsCanvas(compact.id);
+    try fixture.harness.runtime.dispatchPlatformEvent(fixture.app, .{ .window_frame_changed = .{
+        .id = compact.id,
+        .label = settings_window_label,
+        .title = "Settings",
+        .frame = geometry.RectF.init(77, 55, 320, 240),
+        .scale_factor = 2,
+        .open = true,
+        .focused = false,
+    } });
+
+    try fixture.app_state.dispatch(&fixture.harness.runtime, 1, .toggle_size);
+    const expanded = fixture.settingsWindowInfo() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(f32, 77), expanded.frame.x);
+    try std.testing.expectEqual(@as(f32, 55), expanded.frame.y);
+    try std.testing.expectEqual(@as(f32, 420), expanded.frame.width);
+    try std.testing.expectEqual(@as(f32, 360), expanded.frame.height);
 }
 
 test "a user close dispatches on_close and the model owns the consequence" {

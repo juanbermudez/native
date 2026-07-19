@@ -549,6 +549,24 @@ pub const WindowClosePolicy = enum {
     hide,
 };
 
+/// Platform posture beyond ordinary document-window chrome.
+/// `.hud` is a compact, transparent, floating macOS utility surface
+/// anchored at the top center of its current screen. Other platforms
+/// currently preserve ordinary window behavior.
+pub const WindowPresentation = enum {
+    standard,
+    hud,
+};
+
+/// How an in-place window-frame retarget reaches its destination.
+/// `.immediate` preserves the existing deterministic geometry contract.
+/// `.spring` asks the host for an interruptible physical morph; hosts
+/// must collapse it to `.immediate` while reduce-motion is enabled.
+pub const WindowFrameTransition = enum {
+    immediate,
+    spring,
+};
+
 pub const WindowOptions = struct {
     id: WindowId = 1,
     label: []const u8 = "main",
@@ -559,6 +577,7 @@ pub const WindowOptions = struct {
     restore_policy: WindowRestorePolicy = .clamp_to_visible_screen,
     titlebar: WindowTitlebarStyle = .standard,
     show: WindowShowMode = .immediate,
+    presentation: WindowPresentation = .standard,
     /// Content min-size floor the WINDOW enforces (macOS
     /// `contentMinSize`): the user cannot resize below it, so declared
     /// layout floors stop clamping/clipping panes instead of stopping
@@ -632,6 +651,7 @@ pub const WindowCreateOptions = struct {
     restore_policy: WindowRestorePolicy = .clamp_to_visible_screen,
     titlebar: WindowTitlebarStyle = .standard,
     show: WindowShowMode = .immediate,
+    presentation: WindowPresentation = .standard,
     /// Window-enforced content min-size floor (see
     /// `WindowOptions.min_width`/`min_height`); 0 = no floor.
     min_width: f32 = 0,
@@ -651,6 +671,7 @@ pub const WindowCreateOptions = struct {
             .restore_policy = self.restore_policy,
             .titlebar = self.titlebar,
             .show = self.show,
+            .presentation = self.presentation,
             .min_width = self.min_width,
             .min_height = self.min_height,
             .close_policy = self.close_policy,
@@ -2097,6 +2118,10 @@ pub const PlatformServices = struct {
     complete_window_bridge_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, response: []const u8) anyerror!void = null,
     complete_webview_bridge_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, webview_label: []const u8, response: []const u8) anyerror!void = null,
     create_window_fn: ?*const fn (context: ?*anyopaque, options: WindowOptions) anyerror!WindowInfo = null,
+    /// Retarget an existing window without replacing its OS identity.
+    /// Model-declared utility surfaces use this to morph compact ↔
+    /// expanded while preserving focus, z-order, and live view state.
+    set_window_frame_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, frame: geometry.RectF, transition: WindowFrameTransition) anyerror!void = null,
     focus_window_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId) anyerror!void = null,
     close_window_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId) anyerror!void = null,
     /// The real OS minimize verb (macOS miniaturize-to-Dock, Windows
@@ -2417,6 +2442,11 @@ pub const PlatformServices = struct {
     pub fn createWindow(self: PlatformServices, options: WindowOptions) anyerror!WindowInfo {
         const create_fn = self.create_window_fn orelse return error.UnsupportedService;
         return create_fn(self.context, options);
+    }
+
+    pub fn setWindowFrame(self: PlatformServices, window_id: WindowId, frame: geometry.RectF, transition: WindowFrameTransition) anyerror!void {
+        const set_frame_fn = self.set_window_frame_fn orelse return error.UnsupportedService;
+        return set_frame_fn(self.context, window_id, frame, transition);
     }
 
     pub fn focusWindow(self: PlatformServices, window_id: WindowId) anyerror!void {

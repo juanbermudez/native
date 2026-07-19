@@ -275,6 +275,14 @@ pub const NullPlatform = struct {
     /// like `windows` — same seam-regression purpose as
     /// `window_resizable` (the startup create used to hardcode it).
     window_titlebar: [max_windows]WindowTitlebarStyle = [_]WindowTitlebarStyle{.standard} ** max_windows,
+    /// Captured utility-window presentation posture.
+    window_presentation: [max_windows]types.WindowPresentation = [_]types.WindowPresentation{.standard} ** max_windows,
+    /// Successful in-place frame retargets per window. Keeping this
+    /// separate from `windows[index].frame` proves identity was retained
+    /// rather than a close/recreate producing the desired geometry.
+    window_frame_update_count: [max_windows]u32 = [_]u32{0} ** max_windows,
+    /// Last transition requested at the frame-retarget seam.
+    window_frame_transition: [max_windows]types.WindowFrameTransition = [_]types.WindowFrameTransition{.immediate} ** max_windows,
     /// Minimize calls per window (`minimize_window_fn`), indexed like
     /// `windows`: the observable seam for app-drawn minimize controls —
     /// the null platform has no Dock to genie into, so the count IS the
@@ -652,6 +660,7 @@ pub const NullPlatform = struct {
                 .complete_window_bridge_fn = completeWindowBridge,
                 .complete_webview_bridge_fn = completeWebViewBridge,
                 .create_window_fn = createWindow,
+                .set_window_frame_fn = setWindowFrame,
                 .focus_window_fn = focusWindow,
                 .close_window_fn = closeWindow,
                 .minimize_window_fn = minimizeWindow,
@@ -892,6 +901,9 @@ pub const NullPlatform = struct {
         self.windows[self.window_count] = info;
         self.window_resizable[self.window_count] = options.resizable;
         self.window_titlebar[self.window_count] = options.titlebar;
+        self.window_presentation[self.window_count] = options.presentation;
+        self.window_frame_update_count[self.window_count] = 0;
+        self.window_frame_transition[self.window_count] = .immediate;
         self.window_show[self.window_count] = options.show;
         self.window_close_policy[self.window_count] = options.close_policy;
         self.window_min_width[self.window_count] = options.min_width;
@@ -909,6 +921,14 @@ pub const NullPlatform = struct {
         }
         self.window_count += 1;
         return info;
+    }
+
+    fn setWindowFrame(context: ?*anyopaque, window_id: WindowId, frame: geometry.RectF, transition: types.WindowFrameTransition) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        const index = self.findWindowIndex(window_id) orelse return error.WindowNotFound;
+        self.windows[index].frame = frame;
+        self.window_frame_update_count[index] += 1;
+        self.window_frame_transition[index] = transition;
     }
 
     /// Present-before-show bookkeeping shared by every gpu-surface
@@ -2200,8 +2220,11 @@ pub const NullPlatform = struct {
         while (cursor + 1 < self.window_count) : (cursor += 1) {
             self.windows[cursor] = self.windows[cursor + 1];
             self.window_resizable[cursor] = self.window_resizable[cursor + 1];
+            self.window_presentation[cursor] = self.window_presentation[cursor + 1];
             self.window_min_width[cursor] = self.window_min_width[cursor + 1];
             self.window_min_height[cursor] = self.window_min_height[cursor + 1];
+            self.window_frame_update_count[cursor] = self.window_frame_update_count[cursor + 1];
+            self.window_frame_transition[cursor] = self.window_frame_transition[cursor + 1];
             self.window_minimize_count[cursor] = self.window_minimize_count[cursor + 1];
             self.window_show_count[cursor] = self.window_show_count[cursor + 1];
             self.window_occluded[cursor] = self.window_occluded[cursor + 1];

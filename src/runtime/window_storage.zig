@@ -65,6 +65,27 @@ pub fn RuntimeWindowStorage(comptime Runtime: type) type {
             self.invalidated = true;
         }
 
+        /// Change a tracked window's frame without closing it. The
+        /// platform call lands first; runtime geometry advances only on
+        /// success so a refused host update stays retryable and truthful.
+        pub fn setWindowFrame(self: *Runtime, window_id: platform.WindowId, frame: geometry.RectF, transition: platform.WindowFrameTransition) anyerror!void {
+            const index = Self.findWindowIndexById(self, window_id) orelse return error.WindowNotFound;
+            try validateWindowFrame(frame);
+            try self.options.platform.services.setWindowFrame(window_id, frame, transition);
+            // An animated host remains geometry-authoritative while the
+            // spring is in flight: platform frame events advance the
+            // runtime through the rendered poses. Stamping the target
+            // here made automation briefly claim an impossible
+            // descriptor-origin frame before AppKit's first tick.
+            if (transition == .immediate) {
+                self.windows[index].info.frame = frame;
+                if (!self.windows[index].main_frame_set) {
+                    self.windows[index].main_frame = geometry.RectF.init(0, 0, frame.width, frame.height);
+                }
+            }
+            self.invalidated = true;
+        }
+
         pub fn createWindowWithSourceMode(self: *Runtime, options: platform.WindowCreateOptions, source_reloads_from_app: bool, source_policy: WindowSourcePolicy) anyerror!platform.WindowInfo {
             const source: ?platform.WebViewSource = switch (source_policy) {
                 .never_source => null,

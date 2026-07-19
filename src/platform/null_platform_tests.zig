@@ -172,6 +172,30 @@ test "null platform records loaded webview source" {
     try std.testing.expectEqualStrings("<h1>Hello</h1>", null_platform.loaded_source.?.bytes);
 }
 
+test "null platform preserves HUD frame bookkeeping when an earlier window closes" {
+    var null_platform = NullPlatform.init(.{});
+    const services = null_platform.platform().services;
+    _ = try services.createWindow(.{
+        .id = 10,
+        .label = "ordinary",
+        .default_frame = geometry.RectF.init(10, 20, 320, 240),
+    });
+    _ = try services.createWindow(.{
+        .id = 11,
+        .label = "hud",
+        .default_frame = geometry.RectF.init(30, 40, 344, 42),
+        .presentation = .hud,
+    });
+    try services.setWindowFrame(11, geometry.RectF.init(30, 40, 680, 520), .spring);
+
+    _ = null_platform.userCloseWindow(10) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), null_platform.window_count);
+    try std.testing.expectEqual(@as(WindowId, 11), null_platform.windows[0].id);
+    try std.testing.expectEqual(types.WindowPresentation.hud, null_platform.window_presentation[0]);
+    try std.testing.expectEqual(@as(u32, 1), null_platform.window_frame_update_count[0]);
+    try std.testing.expectEqual(types.WindowFrameTransition.spring, null_platform.window_frame_transition[0]);
+}
+
 test "null platform records bridge response window routing" {
     var null_platform = NullPlatform.init(.{});
     try null_platform.platform().services.completeWindowBridge(7, "{\"ok\":true}");
