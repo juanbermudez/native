@@ -5419,8 +5419,14 @@ static BOOL NativeSdkCompositeBlurWriteRegion(NSDictionary *command, CGFloat sca
  * de-occlusion supersedes one; the one-shot flag covers the frame
  * request that arrives during the input dispatch itself. */
 - (void)noteGpuSurfaceInputActivity {
+    const BOOL alreadyInputDriven = self.inputDrivenFramePending;
     self.inputDrivenFramePending = YES;
-    [self rescheduleParkedFrameEventEmission];
+    // The first input supersedes an ordinary/grid- or heartbeat-paced
+    // emission. Further input that lands before that prompt emission fires
+    // folds into it instead of moving the response behind newer main-queue
+    // work (an atomic click's pointer-up must not strand the prompt block
+    // queued by pointer-down).
+    if (!alreadyInputDriven) [self rescheduleParkedFrameEventEmission];
 }
 
 /* Supersede a parked emission with a freshly-paced one (de-occlusion,
